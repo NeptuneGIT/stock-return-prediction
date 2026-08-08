@@ -3,28 +3,33 @@
 #
 # Downloads everything that comes from market/macro sources:
 #   - Daily adjusted prices for the stock universe + benchmarks
-#   - Dividend history for the stock universe
+#   - Dividend history for the stock universe        [NEW]
 #   - FRED macroeconomic series
 #
 # This script ONLY downloads and saves raw data. All feature engineering
 # happens in 02_features.R, so you can re-derive features without
 # re-hitting the APIs.
 #
-# VRT pre-2020-02-10 rows are dropped from prices_daily before it's written
-# to disk: VRT traded as a SPAC (GS Acquisition Holdings Corp) before that
-# date, so those rows are trust-NAV noise (~$10/share), not real Vertiv
-# prices, and would corrupt any feature computed over a window spanning the
-# 2020-02-07 merger.
+# Prices are truncated for VRT before 2020-02-10: Vertiv traded as a SPAC
+# (GS Acquisition Holdings Corp) before that merger date, and pre-merger
+# rows are trust-NAV noise pinned near $10/share, not real VRT prices --
+# any window spanning the merger would otherwise mix the two.
 #
-# Dividends come from Yahoo (via tidyquant) rather than from SEC XBRL
-# deliberately: Yahoo gives actual ex-dividend CASH events, which is what a
-# shareholder receives. SEC's CommonStockDividendsPerShareDeclared is a
-# *declared* figure that many filers tag only annually, and blending
-# declared-vs-paid across tickers would give div_yield a different meaning
-# per stock. No look-ahead risk: a dividend with ex-date D is public on D.
+# Dividends come from Yahoo (via tidyquant) rather than SEC XBRL
+# deliberately: Yahoo reports actual ex-dividend CASH events, which is
+# what a shareholder receives. SEC's CommonStockDividendsPerShareDeclared
+# is a *declared* figure that many filers tag only annually, and blending
+# declared-vs-paid across tickers would give div_yield a different
+# meaning per stock. No look-ahead risk: a dividend with ex-date D is
+# public on D.
+#
+# The universe here is 28 tickers (the original 8 water utilities plus
+# 20 water-adjacent industrials), each verified via
+# verify_candidate_tickers.py (scripts/verifications.py) before being
+# added -- see 02_fundamentals.py for the verification rationale.
 #
 # Output: data/raw/prices_daily.csv
-#         data/raw/dividends_raw.csv
+#         data/raw/dividends_raw.csv   [NEW]
 #         data/raw/macro_fred.csv
 # =============================================================================
 
@@ -36,12 +41,21 @@ library(readr)
 # Configuration
 # -----------------------------------------------------------------------------
 
-# NOTE: MSEX and SJW were removed after auditing their SEC filings.
-# MSEX didn't tag granular quarterly figures for long stretches; SJW
-# never tags an aggregate capex figure at all. See 02a_get_fundamentals.py.
-# BMI (Badger Meter) added as SJW's replacement -- verified via
-# verify_candidate_tickers.py to report all needed tags cleanly.
-STOCKS <- c("AWK", "WTRG", "CWT", "AWR", "XYL", "VRT", "JCI", "BMI")
+# NOTE: MSEX, SJW, WTS, and CR were considered and excluded after
+# auditing their SEC filings (thin/absent XBRL tagging for a feature
+# the model needs -- see EXCLUDED_TICKERS in 02_clean_fundamentals.py
+# for the specific reason for each). BMI (Badger Meter) was added as
+# SJW's replacement; the 20 tickers below PNR..MTZ were added in the
+# 8 -> 28 expansion. All verified via verify_candidate_tickers.py to
+# report all needed tags cleanly -- must stay in sync with TICKERS in
+# 02_fundamentals.py.
+STOCKS <- c(
+  # Original 8-ticker universe
+  "AWK", "WTRG", "CWT", "AWR", "XYL", "VRT", "JCI", "BMI",
+  # Added in the 8 -> 28 expansion
+  "PNR", "MWA", "AOS", "ITT", "IEX", "FELE", "FLS", "DOV", "ECL", "GRC",
+  "ITRI", "MAS", "ROP", "EMR", "PH", "HON", "WMS", "GVA", "PWR", "MTZ"
+)
 
 # PHO is the core benchmark (excess returns are measured against it).
 # SPY is kept for context/reporting, not for the target variable.
@@ -136,6 +150,14 @@ message("Saved ", nrow(prices_daily), " price rows.")
 # One row per ex-dividend event: symbol, date, cash amount per share.
 # 02_features.R sums the trailing 365 days of these to get a TTM
 # dividend, then divides by the raw close price.
+#
+# KNOWN ENVIRONMENT ISSUE: this step has been observed to crash the R
+# session outright (segfault, not a catchable error) when parsing
+# Yahoo's dividend response via quantmod::getDividends -- root-caused to
+# an R/jsonlite bug, not rate-limiting, the ticker list, or this code.
+# If this step fails or returns no data, run
+# `python scripts/get_dividends_fallback.py` instead, which hits the
+# identical Yahoo source and writes the identical output schema.
 
 message("Downloading dividend history...")
 

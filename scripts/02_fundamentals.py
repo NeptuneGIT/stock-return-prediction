@@ -11,25 +11,39 @@ Key design point: every fact is stored with its `filed` date -- the day
 the number actually became public. That is what makes point-in-time
 correctness possible downstream and prevents look-ahead bias.
 
-AssetsCurrent / LiabilitiesCurrent are pulled to support the current_ratio
-feature; both are instant balance-sheet facts, so they need no duration
-filtering or cumulative differencing in 02b. EarningsPerShareDiluted is
-pulled too but kept only as a raw diagnostic column, not a model input.
+AssetsCurrent / LiabilitiesCurrent are INSTANT balance-sheet facts (they
+support current_ratio downstream) and need no duration filtering or
+cumulative differencing in 02b_clean_fundamentals.py.
+EarningsPerShareDiluted is pulled but not currently used as a model
+input -- kept as a raw diagnostic column.
 
 StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest is
-also pulled: CWT stopped tagging plain StockholdersEquity after 2021-03-31
-and switched to this NCI-inclusive tag instead (confirmed via a
-companyfacts audit -- the NCI tag's 2021-03-31 value matches
-StockholdersEquity's last value exactly, then continues cleanly onward).
-Without this tag, roe/debt_to_equity would forward-fill the same 2021-Q1
-value for every subsequent quarter. See 02b for the priority-based
-resolution between the two tags (the same pattern used for CapEx, not a
-blind alias/rename, since the NCI-inclusive figure can genuinely differ
-from the parent-only figure once NCI exists).
+pulled alongside plain StockholdersEquity because at least one filer
+(CWT) stops tagging the plain version once it begins carrying a
+noncontrolling interest in equity (e.g. from a JV/subsidiary) and
+switches to this NCI-inclusive tag instead -- without it, roe/
+debt_to_equity would forward-fill a stale value for many consecutive
+quarters. 02b resolves between the two by priority (the same pattern
+used for CapEx below), never a blind alias/rename, since the
+NCI-inclusive figure can genuinely differ from the parent-only figure.
 
-Requires the SEC_USER_AGENT environment variable (see get_sec_headers()
-below) -- SEC EDGAR requires a real contact string in the User-Agent header
-on every request and will reject unidentified traffic.
+ProfitLoss is pulled alongside NetIncomeLoss for the same reason: some
+filers (e.g. Ecolab) tag NetIncomeLoss only intermittently but ProfitLoss
+(consolidated, including NCI) every quarter. 02b resolves these by
+priority (NetIncomeLoss preferred, ProfitLoss as fallback) rather than
+aliasing them, since the two figures can genuinely differ once a filer
+carries a noncontrolling interest.
+
+PaymentsToAcquireOtherProductiveAssets is pulled alongside
+PaymentsToAcquirePropertyPlantAndEquipment because some filers (e.g.
+Roper Technologies) split CapEx reporting across both tags with only
+partial overlap in coverage -- resolved by priority in CAPEX_PRIORITY,
+same as every other capex tag, never summed.
+
+The universe here is 28 tickers: the original 8 regulated water
+utilities plus 20 water-adjacent equipment/infrastructure/industrial
+names, each verified via verify_candidate_tickers.py
+(scripts/verifications.py) before being added.
 
 Output: data/raw/fundamentals_raw.csv
 """
@@ -46,10 +60,10 @@ import requests
 def get_sec_headers():
     """Build the User-Agent header SEC EDGAR requires on every request.
 
-    SEC EDGAR's fair-access policy requires a real name/contact string, not a
-    generic client string -- see https://www.sec.gov/os/webmaster-faq#developers.
-    Failing loudly here beats silently sending a placeholder that SEC could
-    start blocking without warning.
+    SEC EDGAR's fair-access policy requires a real name/contact string in
+    the User-Agent, not a generic client string, and will reject
+    unidentified traffic -- so this fails loudly instead of silently
+    sending a placeholder.
     """
     user_agent = os.environ.get("SEC_USER_AGENT")
     if not user_agent:
@@ -65,7 +79,20 @@ def get_sec_headers():
 
 HEADERS = get_sec_headers()
 
-TICKERS = ["AWK", "WTRG", "CWT", "AWR", "XYL", "VRT", "JCI", "BMI"]
+TICKERS = [
+    # Original 8-ticker universe (regulated water utilities + water tech/infra)
+    "AWK", "WTRG", "CWT", "AWR", "XYL", "VRT", "JCI", "BMI",
+    # Added in the 8 -> 28 expansion, all verified via
+    # verify_candidate_tickers.py (output/tables/candidate_verification_20260808.csv).
+    # Water/fluid equipment manufacturers:
+    "PNR", "MWA", "AOS", "ITT", "IEX", "FELE", "FLS", "DOV", "ECL", "GRC",
+    # Water metering / plumbing:
+    "ITRI", "MAS",
+    # Diversified industrials with meaningful water/fluid segments:
+    "ROP", "EMR", "PH", "HON",
+    # Infrastructure construction incl. water/wastewater/drainage:
+    "WMS", "GVA", "PWR", "MTZ",
+]
 # MSEX excluded: >50% of its ROE history had to be forward-filled from
 # stale quarters (a 25-consecutive-quarter flat run at worst) because
 # its own SEC filings didn't tag granular quarterly figures for long
@@ -80,6 +107,17 @@ TICKERS = ["AWK", "WTRG", "CWT", "AWR", "XYL", "VRT", "JCI", "BMI"]
 # definition than every other ticker in the panel.
 # BMI (Badger Meter) added as SJW's replacement -- verified via
 # verify_candidate_tickers.py to report all needed tags cleanly.
+# WTS (Watts Water Technologies) considered and excluded: never tags any
+# point-in-time common-shares-outstanding figure under any standard tag
+# (only weighted-average diluted/basic shares used for EPS, and
+# preferred-stock counts) -- confirmed via companyfacts audit. Same
+# category of gap as SJW's missing capex tag, just for shares_outstanding
+# instead of free_cash_flow.
+# CR (Crane Company) considered and excluded: its current CIK
+# (0001944013) only dates to the 2023 Crane Holdings / Crane NXT
+# spinoff, giving it ~19-27 quarters of history depending on tag --
+# well under both MIN_QUARTERS=30 and the project's >=10-year trading
+# history screen. Not a data-quality gap, just too new under this CIK.
 
 # SEC's ticker->CIK file keys on current registered name, so a recent
 # rename can break the automatic lookup (this is what happened with
@@ -117,6 +155,12 @@ TAGS = [
     "LiabilitiesCurrent",
     # Income statement (duration facts)
     "NetIncomeLoss",
+    # Fallback for filers that report net income mostly under the
+    # consolidated-including-NCI tag rather than the parent-only one
+    # (ECL/Ecolab: NetIncomeLoss only 22/54 quarters, ProfitLoss 54/54).
+    # Resolved by PRIORITY in 02b via NET_INCOME_PRIORITY -- same pattern
+    # as StockholdersEquity above, never blindly aliased.
+    "ProfitLoss",
     "EarningsPerShareDiluted",  # retained as a diagnostic only; pe_ratio removed
     # Revenue: companies migrated to the ASC 606 tag around 2018, and
     # some never used the generic "Revenues" tag at all (e.g. CWT).
@@ -146,6 +190,11 @@ TAGS = [
     # its components. Ordered broadest-first below.
     "PaymentsToAcquirePropertyPlantAndEquipment",
     "PaymentsToAcquireProductiveAssets",
+    # ROP (Roper Technologies) splits capex across these two tags with
+    # only 5 quarters of overlap out of 54 -- unioned they cover its
+    # full history, alone neither does. Resolved by PRIORITY like every
+    # other capex tag, never summed.
+    "PaymentsToAcquireOtherProductiveAssets",
     "PaymentsForProceedsFromProductiveAssets",
     "PaymentsForCapitalImprovements",
     "PaymentsToAcquireOtherPropertyPlantAndEquipment",

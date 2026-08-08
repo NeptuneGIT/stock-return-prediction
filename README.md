@@ -1,33 +1,46 @@
-# Water-Sector Stock Return Prediction
+# Quarterly Stock Return Prediction (Water Sector)
 
-An Economics + Computer Science Machine Learning / Data Analytics course
-project. Predicts each stock's next-quarter return in excess of a
-sector benchmark, using an 8-stock universe of regulated water utilities
-and water-adjacent industrials: AWK, AWR, BMI, CWT, JCI, VRT, WTRG, XYL,
-benchmarked against PHO (the water/infrastructure sector ETF).
+Undergraduate Economics + Computer Science ML/Data Analytics course
+project. Predicts a stock's next-quarter return in excess of PHO
+(Invesco Water Resources ETF) from a mix of technical and fundamental
+predictors, using Lasso, Partial Least Squares (PLS), and Bagged
+Regression Splines.
 
-Three models are fit and compared: Lasso (L1-penalized linear
-regression), Partial Least Squares (PLS), and Bagged Regression Splines
-(bagged MARS). Predictors combine SEC fundamentals (return on equity,
-debt-to-equity, asset growth, net income growth, capex intensity,
-current ratio) with market technicals (momentum, volatility, dividend
-yield).
+**Universe:** 28 tickers -- the original 8 regulated water utilities
+(AWK, WTRG, CWT, AWR, XYL, VRT, JCI, BMI) plus 20 water-adjacent
+equipment/infrastructure/industrial names, each screened via
+`scripts/verifications.py` before being added.
 
-Fundamentals are scraped from SEC EDGAR's company-facts API rather than
-a source like Macrotrends specifically because EDGAR reports each fact's
-filing date, which is what lets every predictor be aligned to what a
-trader could actually have known at the time.
+**Target variable:** `exret_next` = a ticker's next-quarter return minus
+PHO's next-quarter return.
+
+**No look-ahead bias:** fundamentals are joined to a quarter by SEC
+filing date, not the fiscal period they describe, and all technical
+features use trailing windows only. Validation is a strict time-based
+split (train on quarters before 2023-01-01, test from 2023-01-01
+onward) rather than random cross-validation.
+
+## Requirements
+
+SEC EDGAR requires a real contact string in the User-Agent header.
+Set it before running anything that hits SEC EDGAR:
+
+```
+export SEC_USER_AGENT="Your Name your.email@example.com"
+```
 
 ## Running it
 
+There is no single runner script yet -- run each stage in order:
+
 ```
-Rscript scripts/01_get_data.R          # prices, dividends, FRED macro data
-python scripts/02_fundamentals.py      # SEC EDGAR fundamentals scrape
+Rscript scripts/01_get_data.R
+python scripts/02_fundamentals.py
 python scripts/02_clean_fundamentals.py
-Rscript scripts/01a_ratios.R           # builds data/processed/panel.csv
-Rscript scripts/03_models.R            # fits Lasso / PLS / Bagged Splines
+Rscript scripts/01a_ratios.R
+Rscript scripts/03_models.R
 ```
 
-Run `python scripts/verifications.py` before adding any ticker to the
-universe -- it checks that SEC EDGAR actually has usable coverage for the
-tags the model depends on before a candidate is added.
+If the dividend-download step in `01_get_data.R` fails or returns no
+rows, run `python scripts/get_dividends_fallback.py` instead -- it
+hits the same Yahoo Finance source and writes the same output schema.

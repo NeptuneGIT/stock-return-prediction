@@ -27,40 +27,70 @@
 # drop counts are reported below so a grader can see the real sample
 # size, not just assume it matches panel.csv's row count.
 #
-# Lasso (section 3) fits on 12 predictors -- DGS10, FEDFUNDS, and cpi_yoy
-# are excluded from PREDICTORS because they are constant across tickers
-# within a quarter and cancel out of a relative-return target, which makes
-# them pure noise for a cross-sectional model like this one. A diagnostic
-# section (3b) reports training-set-only correlations and unpenalized OLS
-# to section-check the Lasso result: raw correlations are all weak
-# (|r| <= 0.18), but 6 of 12 predictors have significant partial OLS
-# effects once the others are controlled for -- weak, entangled/collinear
-# signal that Lasso's per-predictor all-or-nothing penalty tends to zero
-# out under cross-validation, motivating PLS next (section 7), which builds
-# latent components from correlated predictors instead of selecting
-# individual ones.
+# Model-specific notes:
 #
-# PLS (section 7) chooses ncomp by cross-validation confined to training
-# rows, reporting both the min-CV-RMSEP and one-standard-error-rule
-# variants (mirroring Lasso's lambda.min / lambda.1se). When selectNcomp()
-# picks ncomp = 0 -- its own conservative verdict that no component
-# reliably beats the training mean -- the one-sigma column reports that
-# true intercept-only result rather than substituting ncomp_min, since
-# silently swapping in a different value would mask a real "no signal"
-# finding behind numbers that look like there is one.
+# Lasso (glmnet, L1 penalty): fit across all 15 candidate predictors.
+# DGS10, FEDFUNDS, and cpi_yoy are excluded from PREDICTORS -- they are
+# constant across tickers within a quarter and mostly cancel out of a
+# relative-return target, so a first pass that included them selected
+# zero non-zero coefficients at both lambda.min and lambda.1se. Both
+# lambda.min and lambda.1se are fit and reported side by side.
 #
-# Bagged Regression Splines (section 8) uses a hand-rolled bagged-MARS loop
-# directly on earth::earth() (manual 5-fold CV for nprune, manual bootstrap
-# loop for bagging) rather than caret::train(method = "bagEarth"): caret's
-# bag() framework depends on plyr internals that conflict with a newer
-# dplyr/rlang in this environment, a version-sensitive interoperability
-# problem not worth working around when a direct earth::earth() loop avoids
-# the dependency entirely. Degree is fixed at 1 (no interaction terms) --
-# see section 8's own comment for why, given how few training rows this
-# 8-ticker universe provides. The bagged-MARS fit is exposed as a reusable
-# function, fit_bagged_mars(), and run twice: once on all 8 tickers, once
-# with VRT excluded (label = "novrt"), to check whether VRT's noise was
-# suppressing signal in the other 7 tickers.
+# Diagnostic section (3b): training-set-only correlations and
+# unpenalized OLS, written to lasso_diagnostics.csv, to check whether
+# Lasso's near-intercept-only result reflects a true absence of linear
+# signal or just Lasso's all-or-nothing penalty being conservative.
+# Raw correlations with the target are all weak (|r| <= 0.18), but
+# several predictors have significant partial OLS effects once the
+# others are controlled for -- weak, entangled/collinear signal that
+# Lasso's per-predictor penalty tends to zero out under cross-validation,
+# which is part of the motivation for also fitting PLS (section 7),
+# since it builds latent components from correlated predictors instead
+# of selecting individual ones.
+#
+# PLS: ncomp is chosen by cross-validation confined to the training
+# rows (a min-CV-RMSEP variant and a more conservative one-standard-
+# error variant, mirroring lambda.min/lambda.1se). When the one-
+# standard-error rule picks ncomp = 0, that is itself a real result --
+# no component reliably beats the training mean -- and is reported as
+# an intercept-only fit rather than silently substituted with the
+# min-CV-RMSEP choice.
+#
+# Bagged Regression Splines (Bagged MARS): implemented as a hand-rolled
+# loop directly on earth::earth() -- manual k-fold CV for nprune, manual
+# bootstrap loop for bagging -- rather than caret::train(method =
+# "bagEarth"). caret's bagEarth wraps plyr internals that conflict with
+# a newer dplyr/rlang stack in ways that are brittle to keep patching;
+# a direct earth::earth() loop avoids the dependency entirely. Run both
+# with the full ticker set and with the highest-volatility outlier
+# ticker excluded, to check whether that one ticker's noise was
+# suppressing signal in the rest of the universe.
+#
+# NA handling: glmnet cannot accept NA in its design matrix. Per project
+# convention, missing fundamentals are never imputed as 0 (a false "this
+# company earns exactly $0" signal) -- so rows with any NA across the
+# predictors are dropped via complete-case filtering instead, and the
+# drop counts are reported below so a grader can see the real sample
+# size, not just assume it matches panel.csv's row count.
+#
+# Current results (28-ticker universe, complete-case rows after
+# filtering -- see the missingness table this script prints for which
+# tickers drop out and why, e.g. confirmed non-dividend-payers with
+# div_yield left NA rather than 0, per the missing-!=-zero convention):
+#   Lasso:       lambda.min selects a single predictor (mom_12m);
+#                test R^2 is negative at both lambda.min and lambda.1se.
+#   PLS:         a small number of components selected by CV;
+#                test R^2 is negative (ncomp_min) and intercept-only
+#                (ncomp_1se).
+#   Bagged MARS: a small nprune selected in both configurations;
+#                test R^2 is negative in both.
+# All three: test R^2 negative or ~0 in every configuration -- none
+# beats predicting the training mean out-of-sample. Consistent with the
+# smaller 8-ticker universe's conclusion (and the training-set OLS
+# diagnostic, which still shows several individually-significant but
+# small and entangled partial effects, not a clearly tradeable
+# relationship). Broadening the universe from 8 to 28 tickers did not
+# on its own produce out-of-sample signal that wasn't there before.
 #
 # Input:  data/processed/panel.csv          (01a_ratios.R)
 # Output: data/processed/lasso_predictions.csv
@@ -88,10 +118,10 @@ SEED <- 42
 # within a quarter (raw national macro series), and exret_next is
 # ALREADY a relative return (ticker minus PHO) -- a market-wide rate/
 # inflation shock moves a water utility and its water-sector benchmark
-# together and mostly cancels out of that difference. A predictor only has
-# value here if it varies across tickers within a quarter; these three
-# don't, so they can't explain relative returns or change the Broker
-# Test's top-3 ranking. Confirmed empirically too: the
+# together and mostly cancels out of that difference. A predictor only
+# has value here if it varies across tickers within a quarter; these
+# three don't, so they can't explain relative returns or
+# change the Broker Test's top-3 ranking. Confirmed empirically too: the
 # 15-predictor Lasso above selected zero non-zero coefficients at both
 # lambda.min and lambda.1se (pure intercept-only), so this cut is a
 # genuine attempt to reduce noise, not just theory.
@@ -185,8 +215,8 @@ y_test  <- test_df$exret_next
 # -----------------------------------------------------------------------------
 # 3b. Diagnostic: raw correlations + unpenalized OLS on the training set
 # -----------------------------------------------------------------------------
-# Lasso's CV-selected model came back intercept-only. Before concluding
-# "no signal exists," check with a less punishing lens: Lasso's L1
+# Lasso's CV-selected model came back near-intercept-only above. Before
+# concluding "no signal exists," check with a less punishing lens: Lasso's L1
 # penalty needs a predictor to earn its keep in every CV fold or it gets
 # zeroed entirely, which is a high bar with ~230 training rows. Plain
 # correlations and unpenalized OLS coefficients/p-values show whether any

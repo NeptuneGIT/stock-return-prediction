@@ -19,20 +19,54 @@ PIPELINE
 Input:  data/raw/fundamentals_raw.csv
 Output: data/processed/fundamentals_clean.csv
 
-StockholdersEquity is resolved by priority (EQUITY_PRIORITY), the same
-pattern used for CapEx: plain StockholdersEquity wins when a filer reports
-it, falling back to StockholdersEquityIncludingPortionAttributableTo
-NoncontrollingInterest otherwise. This matters because CWT stopped tagging
-plain StockholdersEquity after 2021-03-31 -- without the fallback,
-roe/debt_to_equity would forward-fill that single stale value indefinitely,
-and Liabilities (always derived here via Assets - StockholdersEquity,
-since CWT never tags Liabilities directly) would go stale right along with
-it.
+Several fields are resolved by PRIORITY across more than one SEC tag
+rather than a single fixed tag name, because individual filers are
+inconsistent about which tag they use:
+  - StockholdersEquity (EQUITY_PRIORITY): plain StockholdersEquity wins
+    when a filer reports it, falling back to
+    StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest
+    otherwise. CWT, for example, stops tagging the plain version after
+    2021-03-31 -- without this fallback, roe/debt_to_equity (and
+    Liabilities, always derived here via Assets - StockholdersEquity
+    since CWT never tags Liabilities directly) would forward-fill a
+    stale pre-2021 value indefinitely.
+  - NetIncomeLoss (NET_INCOME_PRIORITY): plain NetIncomeLoss
+    (parent-only) wins when reported, falling back to ProfitLoss
+    (consolidated, including NCI) otherwise. Ecolab, for example, tags
+    NetIncomeLoss for only a fraction of its quarters but ProfitLoss for
+    all of them.
+  - CapEx (CAPEX_PRIORITY): several payments-to-acquire tags are tried
+    in priority order, never summed, since filers split capex reporting
+    across multiple tags with only partial overlap (Roper Technologies,
+    for example, needs two different tags to cover its full history).
+  - shares_outstanding is cross-checked against
+    EntityCommonStockSharesOutstanding for a >10x unit-scale mismatch
+    (see compute_features()) -- individual filers have been observed to
+    tag a share count in the wrong scale (e.g. thousands instead of raw
+    shares) for a single filing that a later restatement corrects. Left
+    uncaught, this kind of error can send pb_ratio/fcf_yield off by
+    orders of magnitude for that one quarter, which is more than enough
+    to distort a model's training fit for the whole panel. This is a
+    generic filer-tagging risk, not specific to any one ticker, so the
+    check runs panel-wide.
 
-Four fundamentals-only ratios are computed here: current_ratio
-(AssetsCurrent / LiabilitiesCurrent), asset_growth (Assets vs. 4 quarters
-ago), ni_growth (NetIncomeLoss TTM year-over-year growth), and
-capex_intensity (CapEx TTM / Assets).
+Derived features:
+  current_ratio    = AssetsCurrent / LiabilitiesCurrent
+  asset_growth     = Assets / Assets(4 quarters ago) - 1
+  ni_growth        = NetIncomeLoss TTM YoY growth
+  capex_intensity  = CapEx TTM / Assets
+
+(asset_turnover, Revenues TTM / Assets, was tried and dropped: TTM
+revenue needs four CONSECUTIVE tagged quarters, and at least one ticker
+in this universe rarely has them, leaving asset_turnover mostly a stale
+forward-filled value rather than a fresh observation for that name --
+removed rather than kept as a near-constant column that couldn't move
+the Broker Test's cross-sectional ranking anyway.)
+
+The universe here is 28 tickers: the original 8 regulated water
+utilities plus 20 water-adjacent names, each verified via
+verify_candidate_tickers.py before being added; a couple of candidates
+(WTS, CR) were considered and excluded -- see EXCLUDED_TICKERS below.
 
 WHY THE REMAINING FOUR ARE COMPUTED HERE AND NOT IN 02_features.R
 They depend only on fundamentals, so they must be computed on the
@@ -78,7 +112,18 @@ STUDY_END = "2026-12-31"
 # SJW is listed too as defence-in-depth: the scraper no longer fetches
 # it, but this guards against re-running the cleaner against a stale
 # raw file that still contains SJW rows.
-EXCLUDED_TICKERS = {"MSEX", "SJW"}
+# WTS (Watts Water Technologies) considered during the 8->28 expansion
+# and excluded: never tags a point-in-time common-shares-outstanding
+# figure under any standard tag (confirmed via companyfacts audit --
+# only weighted-average diluted/basic shares and preferred-stock counts
+# exist), so shares_outstanding is uncomputable for all its quarters.
+# Same category of gap as SJW's missing capex tag.
+# CR (Crane Company) considered and excluded: its current CIK
+# (0001944013) only dates to the 2023 Crane Holdings / Crane NXT
+# spinoff -- well under both the verifier's MIN_QUARTERS=30 and the
+# project's >=10-year trading-history screen. Also listed here as
+# defence-in-depth in case a stale raw file still contains its rows.
+EXCLUDED_TICKERS = {"MSEX", "SJW", "WTS", "CR"}
 
 # Flow facts cover a period (income statement, cash flow statement) and
 # need duration filtering. Everything else is an instant balance-sheet
@@ -89,6 +134,7 @@ EXCLUDED_TICKERS = {"MSEX", "SJW"}
 # duration-filtered or differenced.
 FLOW_TAGS = {
     "NetIncomeLoss",
+    "ProfitLoss",  # fallback for NetIncomeLoss -- see NET_INCOME_PRIORITY
     "OperatingIncomeLoss",
     "Revenues",
     "EarningsPerShareDiluted",
@@ -122,6 +168,11 @@ OCF_ALIASES = {
 CAPEX_PRIORITY = [
     "PaymentsToAcquirePropertyPlantAndEquipment",
     "PaymentsToAcquireProductiveAssets",
+    # ROP (Roper Technologies) splits capex across these two tags with
+    # only 5 quarters of overlap out of 54 -- alone neither covers its
+    # full history, unioned they do. Resolved by priority like every
+    # other tag here, never summed.
+    "PaymentsToAcquireOtherProductiveAssets",
     "PaymentsForProceedsFromProductiveAssets",
     "PaymentsForCapitalImprovements",
     "PaymentsToAcquireWaterAndWasteWaterSystems",
@@ -145,6 +196,20 @@ CAPEX_PRIORITY = [
 EQUITY_PRIORITY = [
     "StockholdersEquity",
     "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+]
+
+# NetIncomeLoss has the same "not a blind alias" problem as
+# StockholdersEquity: ECL (Ecolab) tags plain NetIncomeLoss (attributable
+# to parent) for only 22/54 quarters, but tags ProfitLoss (consolidated,
+# including any noncontrolling interest) for all 54. The two can
+# genuinely differ once a filer carries a noncontrolling interest, so
+# this resolves by PRIORITY -- parent-only NetIncomeLoss wins whenever a
+# filer reports it -- never summed or blindly renamed. Keeps roe's
+# numerator consistent with the parent-only preference already used for
+# its denominator (EQUITY_PRIORITY above).
+NET_INCOME_PRIORITY = [
+    "NetIncomeLoss",
+    "ProfitLoss",
 ]
 
 # Cover-page facts are dated near the FILING date, not the fiscal
@@ -315,9 +380,13 @@ def pivot_wide(df):
     # but it reopens exactly the failure mode above, where one
     # sparsely-tagged column drags a whole row's availability date out.
     # That bug cost 1156 days on one MSEX quarter; not worth re-risking.
+    # NET_INCOME_PRIORITY included alongside EQUITY_PRIORITY for the same
+    # reason: ProfitLoss now genuinely feeds roe for filers like ECL
+    # (Ecolab) that mostly tag it instead of plain NetIncomeLoss, so its
+    # filing date must count toward this row's availability date too.
     feature_tags = [
-        "NetIncomeLoss", "Assets", "Liabilities",
-    ] + EQUITY_PRIORITY
+        "Assets", "Liabilities",
+    ] + NET_INCOME_PRIORITY + EQUITY_PRIORITY
     core = main[main["tag"].isin(feature_tags)]
     filed = core.groupby(["ticker", "end"])["filed"].max().reset_index()
     # Fall back to the all-tag max for any quarter with no core tags.
@@ -446,6 +515,47 @@ def compute_features(df):
     ):
         if col in df.columns:
             shares = df[col] if shares is None else shares.fillna(df[col])
+
+    # UNIT-SCALE SANITY CHECK (found during the 8 -> 28 expansion,
+    # 2026-08-08, root-caused while investigating a bagged-MARS train
+    # R^2 of -190): ROP's FY2016 10-K (filed 2017-02-27) tags
+    # CommonStockSharesOutstanding for end=2016-12-31 as 101672 -- i.e.
+    # in THOUSANDS of shares -- while ROP's own later FY2017 10-K (filed
+    # 2018-02-23) restates the identical period as 101672000, in raw
+    # shares. Same tag name both times; nothing in the XBRL metadata
+    # distinguishes them, and dedupe_point_in_time() correctly keeps the
+    # earlier (mis-scaled) filing per the no-look-ahead rule, since that
+    # really is what the market saw first. Left unchecked, the
+    # 1000x-too-small share count sends book_value_per_share (hence
+    # pb_ratio) ~1000x too low and market cap (hence fcf_yield) ~1000x
+    # too high for that single quarter -- which alone was enough to blow
+    # up bagged-MARS's bagged predictions by orders of magnitude via one
+    # bootstrap-resampled training row. This is a generic filer-tagging
+    # risk (any ticker/quarter could hit it), not a ROP-specific patch,
+    # so the check applies panel-wide: cross-check the priority-picked
+    # share count against EntityCommonStockSharesOutstanding (a
+    # cover-page fact -- a single scalar per filing, not observed to
+    # have this scale problem anywhere in this dataset). Where the two
+    # differ by more than 10x, trust the cover-page figure instead; it
+    # is confirmed correctly scaled for the SAME filing in the case that
+    # motivated this check (ROP's cover page reports 101,434,201 shares
+    # as of 2017-02-24, filed 2017-02-27 -- the very filing that tagged
+    # CommonStockSharesOutstanding as 101672).
+    if "EntityCommonStockSharesOutstanding" in df.columns:
+        cover = df["EntityCommonStockSharesOutstanding"]
+        ratio = shares / cover
+        bad_scale = shares.notna() & cover.notna() & ((ratio > 10) | (ratio < 0.1))
+        n_bad = int(bad_scale.sum())
+        if n_bad:
+            print(
+                f"WARNING: {n_bad} shares_outstanding value(s) off by >10x vs "
+                f"EntityCommonStockSharesOutstanding (likely a units error in "
+                f"the underlying filing) -- using the cover-page figure "
+                f"instead. Tickers affected: "
+                f"{sorted(df.loc[bad_scale, 'ticker'].unique())}"
+            )
+            shares = shares.mask(bad_scale, cover)
+
     df["shares_outstanding"] = shares
 
     # Resolve StockholdersEquity by priority, same pattern as CapEx: the
@@ -482,6 +592,31 @@ def compute_features(df):
         n = len(df)
         df["Liabilities"] = derived_liab
     print(f"Derived {n} Liabilities from Assets - StockholdersEquity")
+
+    # Resolve NetIncomeLoss by priority, same pattern as StockholdersEquity
+    # just above: the first available tag in NET_INCOME_PRIORITY wins
+    # (parent-only NetIncomeLoss first), never summed. This backfills
+    # ECL's (Ecolab) NetIncomeLoss gap with its consolidated ProfitLoss
+    # tag without disturbing any filer that already reports NetIncomeLoss
+    # every quarter.
+    net_income = None
+    net_income_source = pd.Series(pd.NA, index=df.index, dtype="object")
+    for col in NET_INCOME_PRIORITY:
+        if col not in df.columns:
+            continue
+        if net_income is None:
+            net_income = df[col].copy()
+            net_income_source = net_income_source.mask(df[col].notna(), col)
+        else:
+            newly = net_income.isna() & df[col].notna()
+            net_income = net_income.fillna(df[col])
+            net_income_source = net_income_source.mask(newly, col)
+    if net_income is None:
+        print("WARNING: no NetIncomeLoss tag (parent-only or consolidated) found")
+        df["NetIncomeLoss"] = pd.NA
+    else:
+        df["NetIncomeLoss"] = net_income
+    df["net_income_source_tag"] = net_income_source
 
     df["roe"] = df["NetIncomeLoss"] / df["StockholdersEquity"]
     df["debt_to_equity"] = df["Liabilities"] / df["StockholdersEquity"]
@@ -696,7 +831,7 @@ def main():
         "shares_outstanding", "free_cash_flow",
         # --- raw / diagnostic ---
         "capex", "capex_ttm", "OperatingCashFlow", "capex_source_tag",
-        "equity_source_tag",
+        "equity_source_tag", "net_income_source_tag",
         "ni_ttm",
         "roe_is_filled", "debt_to_equity_is_filled", "shares_outstanding_is_filled",
         "free_cash_flow_is_filled", "current_ratio_is_filled",

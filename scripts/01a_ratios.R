@@ -3,7 +3,7 @@
 #
 # Builds the quarterly modelling panel from:
 #   - data/raw/prices_daily.csv              (01_get_data.R)
-#   - data/raw/dividends_raw.csv             (01_get_data.R)
+#   - data/raw/dividends_raw.csv             (01_get_data.R)   [NEW]
 #   - data/raw/macro_fred.csv                (01_get_data.R)
 #   - data/processed/fundamentals_clean.csv  (02b_clean_fundamentals.py)
 #
@@ -19,22 +19,36 @@
 #      does NOT have Q1 2023's earnings -- those file in late April.
 #   2. Technical features use only trailing windows.
 #
-# A few implementation notes worth knowing before touching this file:
-#   - asset_growth, capex_intensity, ni_growth and current_ratio arrive
-#     ready-made from 02b and are simply carried through the join rather
-#     than computed here. That's deliberate: the point-in-time join below
-#     repeats the same filing across quarters when no new one landed, so a
-#     year-over-year change computed AFTER the join would sometimes compare
-#     a filing to itself and report 0% growth.
-#   - pb_ratio and fcf_yield use raw `close`, not `adjusted`. Adjusted
+# Notes on a few predictor decisions:
+#   - No pe_ratio/eps_ttm here -- EarningsPerShareDiluted is carried
+#     through 02b_clean_fundamentals.py as a raw diagnostic column but
+#     isn't turned into a valuation ratio in this panel.
+#   - div_yield is computed on this side (it needs a price, which only
+#     exists here), while asset_growth/capex_intensity/ni_growth/
+#     current_ratio arrive READY-MADE from 02b and are simply carried
+#     through the join rather than recomputed here -- the join below can
+#     repeat the same filing across quarters when no new one has landed,
+#     so a year-over-year change computed AFTER the join would sometimes
+#     compare a filing to itself and report a false 0% growth.
+#   - pb_ratio and fcf_yield use raw `close`, not `adjusted`: adjusted
 #     prices are back-corrected downward for past dividends, which would
-#     inflate every historical valuation yield if used here. Returns still
-#     use `adjusted`, which is correct for returns.
+#     inflate every historical valuation yield. Returns still use
+#     `adjusted`, which is correct for returns.
 #   - FEDFUNDS/CPIAUCSL are forward-filled with zoo::na.locf() onto the
-#     daily grid before the roll = Inf macro join, since those monthly
-#     series would otherwise be NA on all but ~12 rows/year at quarter-end
-#     (the roll join finds the nearest date, not the nearest non-NA value
-#     per column).
+#     daily grid BEFORE the roll = Inf macro join, since those monthly
+#     series are otherwise NA on all but ~12 rows/year at quarter-end
+#     (the roll join finds the nearest date, not the nearest non-NA
+#     value per column).
+#   - The quarterly bucketing step drops any bucket whose quarter_end is
+#     later than the most recently FULLY ELAPSED quarter
+#     (last_complete_quarter_end), before qtr_ret_next/exret_next are
+#     computed -- otherwise a not-yet-finished quarter's partial data
+#     would get bucketed and used as a fake "next quarter" return for
+#     the row before it. Fixed here at the source rather than deferred
+#     downstream -- see the comment at the fix site.
+#   - The universe here is 28 tickers (8 -> 28 expansion) -- see STOCKS
+#     in 01_get_data.R. Nothing in this file is ticker-count-specific:
+#     PREDICTORS/FILL_FLAGS below are already generic over ticker.
 #
 # Output: data/processed/panel.csv
 # =============================================================================
@@ -116,11 +130,27 @@ prices <- prices %>%
 # comparing different time periods. Fiscal-calendar differences are
 # handled on the fundamentals side, via the filing-date join below.
 
+# KNOWN ISSUE FIX: without a cutoff, this bucketing step would assign
+# whatever trading days have occurred so far in the CURRENT, not-yet-
+# finished quarter to that quarter's quarter_end, using today's price as
+# a stand-in for a quarter-end close that doesn't exist yet. The row
+# immediately before it would then get qtr_ret_next/exret_next computed
+# from that fake partial-quarter return instead of a real completed one
+# -- silently wrong, not just missing. Dropping the not-yet-elapsed
+# quarter's bucket here, before qtr_ret/qtr_ret_next/exret_next are
+# computed below, means every downstream step (the lead()-based target
+# construction, the fundamentals roll-join) only ever sees real,
+# completed quarters. This is deliberately separate from the
+# STUDY_START trim below -- that trims the WARM-UP period, this trims
+# the IN-PROGRESS period, and conflating the two would muddy both.
+last_complete_quarter_end <- floor_date(Sys.Date(), "quarter") - days(1)
+
 quarterly <- prices %>%
   mutate(quarter_end = ceiling_date(date, "quarter") - days(1)) %>%
   group_by(symbol, quarter_end) %>%
   slice_max(date, n = 1, with_ties = FALSE) %>%
   ungroup() %>%
+  filter(quarter_end <= last_complete_quarter_end) %>%
   select(symbol, quarter_end, date, close, adjusted, mom_3m, mom_12m, vol_60d)
 
 # Quarterly total return, and the NEXT quarter's return (the target's
