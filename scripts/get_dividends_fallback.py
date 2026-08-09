@@ -58,15 +58,60 @@ import requests
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; research script)"}
 
 # Must stay in sync with STOCKS in 01_get_data.R / TICKERS in
-# 02_fundamentals.py. Benchmarks (PHO, SPY) deliberately excluded, same
-# as the R script -- only the 28 tradeable tickers need dividend history.
+# 02_fundamentals.py. The benchmark (SPY only, since PHO was removed in
+# the S&P-500-universe pivot) is deliberately excluded here too, same as
+# the R script -- only the tradeable tickers need dividend history.
+#
+# Finalized 222-ticker S&P 500 universe from the 28 -> 222 pivot (see
+# 02_fundamentals.py's TICKERS -- byte-identical list, full per-sector
+# breakdown and rationale there -- and verifications.py for the
+# screening results).
 STOCKS = [
+    # Original 8-ticker universe
     "AWK", "WTRG", "CWT", "AWR", "XYL", "VRT", "JCI", "BMI",
+    # Added in the 8 -> 28 expansion
     "PNR", "MWA", "AOS", "ITT", "IEX", "FELE", "FLS", "DOV", "ECL", "GRC",
     "ITRI", "MAS", "ROP", "EMR", "PH", "HON", "WMS", "GVA", "PWR", "MTZ",
+    # --- Information Technology (32 total: 1 original + 31 new) ---
+    "MSFT", "AAPL", "NVDA", "ORCL", "CRM", "ADBE", "CSCO", "AMD", "QCOM",
+    "TXN", "IBM", "INTU", "AMAT", "ADI", "LRCX", "KLAC", "MU", "SNPS",
+    "CDNS", "ADSK", "MCHP", "ON", "TER", "WDC", "STX", "NTAP", "TYL",
+    "PTC", "SWKS", "GRMN", "ZBRA",
+    # --- Health Care (26 total, all new) ---
+    "JNJ", "UNH", "LLY", "MRK", "PFE", "TMO", "ABT", "DHR", "BMY", "AMGN",
+    "GILD", "CVS", "ELV", "HUM", "SYK", "BSX", "ISRG", "ZBH", "BDX", "BAX",
+    "VRTX", "BIIB", "MCK", "COR", "HCA", "DVA",
+    # --- Financials (24 total, all new) ---
+    "C", "GS", "MS", "BNY", "SCHW", "SPGI", "MCO", "ICE", "AON", "MRSH",
+    "AJG", "ALL", "PGR", "HIG", "STT", "FITB", "AXP", "COF", "NDAQ",
+    "MSCI", "FDS", "CBOE", "NTRS", "WTW",
+    # --- Consumer Discretionary (24 total, all new) ---
+    "AMZN", "TSLA", "HD", "MCD", "LOW", "SBUX", "TJX", "ORLY", "AZO",
+    "ROST", "YUM", "MAR", "HLT", "GM", "APTV", "BBY", "DHI", "PHM", "NVR",
+    "WHR", "TSCO", "ULTA", "GPC", "CMG",
+    # --- Communication Services (10 total, all new) ---
+    "NFLX", "T", "VZ", "TMUS", "EA", "TTWO", "OMC", "LYV", "MTCH", "SIRI",
+    # --- Industrials (36 total: 22 original + 14 new) ---
+    "CAT", "DE", "UNP", "FDX", "BA", "LMT", "RTX", "GD", "NOC", "CSX",
+    "NSC", "WM", "RSG", "GE",
+    # --- Consumer Staples (15 total, all new) ---
+    "PG", "KO", "PEP", "COST", "WMT", "PM", "MO", "MDLZ", "CL", "KMB",
+    "GIS", "ADM", "CAG", "CLX", "CHD",
+    # --- Energy (12 total, all new) ---
+    "CVX", "EOG", "SLB", "MPC", "VLO", "OXY", "WMB", "KMI", "OKE", "DVN",
+    "HAL", "TRGP",
+    # --- Utilities (17 total: 4 original water utilities + 13 new) ---
+    "AEP", "DUK", "SO", "D", "EXC", "XEL", "ED", "PEG", "ES", "FE", "ETR",
+    "EIX", "PPL",
+    # --- Real Estate (13 total, all new) ---
+    "AMT", "EQIX", "CCI", "PSA", "O", "WELL", "AVB", "EQR", "VTR", "IRM",
+    "UDR", "HST", "BXP",
+    # --- Materials (13 total: 1 original + 12 new) ---
+    "APD", "SHW", "FCX", "NEM", "PPG", "NUE", "ALB", "CE", "IFF", "MLM",
+    "VMC", "IP",
 ]
 
-START_DATE = "2013-01-01"
+START_DATE = "2003-01-01"
 OUT_PATH = Path("data/raw/dividends_raw.csv")
 REQUEST_DELAY = 0.3
 

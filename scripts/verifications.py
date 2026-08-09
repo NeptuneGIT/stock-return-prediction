@@ -6,7 +6,7 @@ RUN THIS BEFORE adding any replacement/additional ticker to
 
 WHY: SJW passed a casual eyeball test (regulated water utility, long
 history, files 10-Ks) and still turned out to be unusable, because it
-never tags an aggregate capex figure. We only discovered that after
+never tags an aggregate capex figure. That was only discovered after
 scraping and cleaning it. This script front-loads that check.
 
 It scores each candidate on the tags that actually feed the model:
@@ -16,43 +16,66 @@ It scores each candidate on the tags that actually feed the model:
   free_cash_flow  <- OperatingCashFlow AND a real capex tag
 
 A candidate is only safe if it clears ALL of them with good coverage
-over your study window. Anything that fails the capex check is
-another SJW.
+over the study window. Anything that fails the capex check is another
+SJW. Candidates are scored by the UNION of quarter-end coverage across
+every alternative tag in a requirement's list, not just the single
+best-covering tag, matching what the production cleaner
+(02_clean_fundamentals.py) actually does -- its priority-fallback fills
+gaps across tags via .fillna(), which is exactly a coverage union, so
+scoring by the single best tag alone would undercount a candidate whose
+coverage is split across several tags.
 
 Output: a PASS/FAIL table per candidate printed to the console, plus a
 persisted CSV at output/tables/candidate_verification_<YYYYMMDD>.csv so
 a run's results survive to be cited in EXCLUDED_TICKERS/CAPEX_PRIORITY
-comments later (the console table alone doesn't survive past the
-terminal scrollback).
+comments later.
 
-CANDIDATE_TICKERS is a flat list, resolved to CIKs automatically via
-SEC's company_tickers.json (mirroring get_cik_map() in
-02_fundamentals.py) rather than a hand-maintained ticker->CIK dict --
-that stops scaling once there are more than a couple of candidates.
-MANUAL_CIK_OVERRIDES still exists for the cases auto-lookup gets wrong
-(renamed/restructured filers).
+CIK lookup is automatic via SEC's company_tickers.json
+(mirroring get_cik_map() in 02_fundamentals.py), with
+MANUAL_CIK_OVERRIDES for the cases auto-lookup gets wrong (renamed or
+restructured filers, the same failure mode that hit SJW/"H2O America").
+STUDY_START_YEAR and MIN_QUARTERS are set in lockstep with
+01_get_data.R's START_DATE and 01a_ratios.R's STUDY_START -- if those
+move, this needs to move with them or a candidate's coverage window here
+won't match what the actual pipeline needs. MIN_QUARTERS = 48 (12 years)
+is a judgment call balancing "enough clean tickers survive the screen"
+against "history is actually long enough to be worth the project's
+15-20yr target," not a value derived mechanically.
 
-REQUIREMENTS["equity"] accepts both plain StockholdersEquity and
-StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest,
-matching 02_clean_fundamentals.py's EQUITY_PRIORITY fallback -- a
-candidate that exclusively tags the NCI-inclusive variant should not be
-marked NOT USABLE when the cleaner would handle it fine.
-REQUIREMENTS["net_income"] similarly accepts "ProfitLoss" as a fallback
-for "NetIncomeLoss", matching NET_INCOME_PRIORITY. REQUIREMENTS["capex"]
-includes "PaymentsToAcquireOtherProductiveAssets" as a candidate tag not
-yet in the scraper, since some filers split capex reporting across more
-than one tag with only partial overlap.
+SCREENING RESULTS FOR THE CURRENT UNIVERSE
+This universe grew from an initial 8-ticker water-utility set through a
+28-ticker water/infrastructure-adjacent expansion to the current
+222-ticker S&P 500 universe, screening roughly 270 candidates for the
+pivot to the full S&P 500 (240 in the main batch below, plus a
+30-candidate supplemental round targeting the thinnest sectors).
+Overall reject rate for the pivot was ~28%, meaningfully higher than the
+8->28 expansion's, concentrated in Financials and Communication
+Services: most bank/insurer rejects failed specifically on `capex`,
+since banks and insurers structurally don't tag a PP&E-style capex
+figure the way an industrial or utility does (payment networks,
+exchanges, and asset managers like V, MA, BX, KKR, SYF failed for the
+same reason, while NDAQ/MSCI/FDS/CBOE/AXP/COF/NTRS/WTW passed).
 
-evaluate() scores each requirement by the UNION of quarter-end coverage
-across every alternative tag in its list, not just the single
-best-covering tag -- this matches what the production cleaner actually
-does for shares/capex/equity/net_income (priority-fallback fills gaps
-across tags, which is exactly a coverage union), so a candidate whose
-best single tag looks thin but whose tags collectively cover the study
-window is scored correctly rather than undercounted.
-
-Results are persisted to output/tables/ as well as printed, so a run's
-findings survive past the terminal scrollback to be cited later.
+A handful of "casual eyeball test" failures are worth calling out
+explicitly, since they extend the SJW/CR lesson this script exists to
+catch: XOM and BLK both resolve to newly-registered holding-company CIKs
+with only a handful of quarters of history under that exact CIK (real,
+current SEC ticker->CIK mappings, verified directly against SEC's bulk
+company_tickers.json, reflecting recent holding-company restructurings,
+not a lookup bug); GOOGL (Alphabet's 2015 reorg), MDT (Medtronic plc's
+2015 Ireland redomiciliation), and DIS (2019 registrant change) are the
+same pattern. A ticker being an obvious, decades-old household name is
+not evidence its current SEC registrant has matching history. AEP
+required a MANUAL_CIK_OVERRIDES entry: present and active in SEC's own
+submissions API but absent from the bulk company_tickers.json used for
+lookup, a bulk-file gap rather than a corporate event. BK and MMC
+returned no CIK under those symbols because both tickers changed (Bank
+of New York Mellon to BNY, Marsh & McLennan to MRSH); re-verified and
+added under their new symbols. JNPR, IPG, HES, K, DFS, and PARA all
+returned no CIK with no renamed successor findable, consistent with each
+having been acquired or taken private and no longer filing as
+independent registrants -- dropped from the candidate pool entirely
+rather than guessed at.
 """
 
 import csv
@@ -66,13 +89,7 @@ import requests
 
 
 def get_sec_headers():
-    """Build the User-Agent header SEC EDGAR requires on every request.
-
-    SEC EDGAR's fair-access policy requires a real name/contact string in
-    the User-Agent, not a generic client string, and will reject
-    unidentified traffic -- so this fails loudly instead of silently
-    sending a placeholder.
-    """
+    """Build the User-Agent header SEC EDGAR requires on every request."""
     user_agent = os.environ.get("SEC_USER_AGENT")
     if not user_agent:
         sys.exit(
@@ -87,39 +104,70 @@ def get_sec_headers():
 
 HEADERS = get_sec_headers()
 
-# Candidates for the 8->25-30 ticker expansion. The pure regulated-water-
-# utility universe is exhausted (YORW/ARTNA/CWCO/GWRS already rejected for
-# thin XBRL tagging -- the same failure mode that killed SJW; MSEX/SJW
-# themselves excluded -- see 02_clean_fundamentals.py EXCLUDED_TICKERS), so
-# this list leans into water-adjacent equipment/infrastructure/industrial
-# names, the same character as the already-included XYL/VRT/JCI/BMI.
-# PNR and WTS were checked once before (old hardcoded CANDIDATES dict) but
-# never added -- re-verified here alongside the new names.
+# Candidates for the 28 -> ~200-250 ticker S&P-500-universe pivot. The
+# prior water-adjacent CANDIDATE_TICKERS list from the 8->28 expansion is
+# gone from here -- every ticker on it is now either already live in
+# TICKERS (02_fundamentals.py) or already a confirmed reject in
+# EXCLUDED_TICKERS (02_clean_fundamentals.py; WTS/CR), so none of them
+# need re-screening.
+#
+# This list is ~240 NEW candidates spanning the 10 GICS sectors the
+# existing 28 barely touch (that list is almost entirely Industrials +
+# 4 water Utilities + 1 Materials + 1 Information Technology name), sized
+# so that 240 new + 28 already-verified = ~268 total candidate pool,
+# inside the plan's 260-300 target. Selection favors long-listed
+# (pre-2008 IPO/spinoff where practical) large/mid-cap names for the
+# 15-20yr history target, spans market-cap tiers within each sector
+# rather than only mega-caps, and deliberately includes a small minority
+# of newer spinoffs/mergers/renames (e.g. RTX, KHC, TFC, DD, WBD, K, GE)
+# as calculated-risk candidates likely to fail the MIN_QUARTERS=48 (12yr)
+# or CIK-history check -- same posture as the CR (Crane) precedent from
+# the 8->28 expansion: let this script's own screen decide, don't
+# hand-filter borderline cases out in advance. Smaller sectors
+# (Materials, Real Estate, Utilities, Communication Services) are
+# oversampled relative to their S&P 500 market-cap weight so all 11 GICS
+# sectors end up meaningfully represented in the final universe, not just
+# proportionally represented.
 CANDIDATE_TICKERS = [
-    "PNR",   # Pentair -- water treatment/pool equipment
-    "WTS",   # Watts Water Technologies -- water safety/flow control
-    "MWA",   # Mueller Water Products -- pipes, valves, meters
-    "AOS",   # A.O. Smith -- water heaters/water treatment
-    "ITT",   # ITT Inc -- pumps, fluid technology
-    "IEX",   # IDEX Corp -- fluidics, pumps
-    "FELE",  # Franklin Electric -- water & fuel pumping systems
-    "FLS",   # Flowserve Corp -- pumps/valves/seals, flow control
-    "DOV",   # Dover Corp -- pumps, fluid transfer
-    "ECL",   # Ecolab -- water treatment chemicals
-    "GRC",   # Gorman-Rupp -- pump manufacturer
-    "CR",    # Crane Company -- fluid handling
-    "ROP",   # Roper Technologies -- water metering (Neptune) + diversified
-    "EMR",   # Emerson Electric -- automation incl. water/wastewater
-    "PH",    # Parker Hannifin -- fluid power/motion control
-    "HON",   # Honeywell -- process/building/water solutions
-    "WMS",   # Advanced Drainage Systems -- stormwater/drainage infrastructure
-    "GVA",   # Granite Construction -- infrastructure incl. water/wastewater
-    # Added for buffer after the first verification pass landed at 24
-    # tickers (8 existing + 16 USABLE), one short of the 25-30 target.
-    "MAS",   # Masco -- Delta Faucet, plumbing products
-    "ITRI",  # Itron -- smart metering, incl. water meters (competes w/ BMI)
-    "PWR",   # Quanta Services -- infrastructure construction incl. water/electric
-    "MTZ",   # MasTec -- infrastructure construction incl. water/sewer
+    # --- Information Technology (35) ---
+    "MSFT", "AAPL", "NVDA", "AVGO", "ORCL", "CRM", "ADBE", "CSCO", "ACN",
+    "AMD", "QCOM", "TXN", "IBM", "INTU", "AMAT", "ADI", "LRCX", "KLAC",
+    "MU", "SNPS", "CDNS", "ADSK", "NXPI", "MCHP", "ON", "TER", "JNPR",
+    "WDC", "STX", "NTAP", "TYL", "PTC", "SWKS", "GRMN", "ZBRA",
+    # --- Health Care (30) ---
+    "JNJ", "UNH", "LLY", "ABBV", "MRK", "PFE", "TMO", "ABT", "DHR", "BMY",
+    "AMGN", "MDT", "GILD", "CVS", "CI", "ELV", "HUM", "SYK", "BSX", "ISRG",
+    "ZBH", "BDX", "BAX", "REGN", "VRTX", "BIIB", "MCK", "COR", "HCA", "DVA",
+    # --- Financials (30) ---
+    "JPM", "BAC", "WFC", "C", "GS", "MS", "USB", "PNC", "TFC", "BK",
+    "SCHW", "BLK", "SPGI", "MCO", "CME", "ICE", "AON", "MMC", "AJG", "TRV",
+    "ALL", "AIG", "PGR", "MET", "PRU", "AFL", "CB", "HIG", "STT", "FITB",
+    # --- Consumer Discretionary (29) ---
+    "AMZN", "TSLA", "HD", "MCD", "NKE", "LOW", "SBUX", "TJX", "BKNG",
+    "ORLY", "AZO", "ROST", "YUM", "MAR", "HLT", "GM", "F", "APTV", "BBY",
+    "DHI", "LEN", "PHM", "NVR", "WHR", "TSCO", "ULTA", "GPC", "CMG", "EXPE",
+    # --- Communication Services (15) ---
+    "GOOGL", "META", "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS", "CHTR",
+    "EA", "TTWO", "WBD", "OMC", "IPG", "LYV",
+    # --- Industrials, beyond the existing 22 water/fluid-equipment names (15) ---
+    "CAT", "DE", "UNP", "UPS", "FDX", "BA", "LMT", "RTX", "GD", "NOC",
+    "CSX", "NSC", "WM", "RSG", "GE",
+    # --- Consumer Staples (23) ---
+    "PG", "KO", "PEP", "COST", "WMT", "PM", "MO", "MDLZ", "CL", "KMB",
+    "GIS", "KHC", "HSY", "STZ", "SYY", "ADM", "TSN", "TAP", "CAG", "CLX",
+    "MKC", "K", "CHD",
+    # --- Energy (18) ---
+    "XOM", "CVX", "COP", "EOG", "SLB", "PSX", "MPC", "VLO", "OXY", "WMB",
+    "KMI", "OKE", "HES", "DVN", "FANG", "BKR", "HAL", "TRGP",
+    # --- Utilities, beyond the existing 4 water utilities (15) ---
+    "NEE", "DUK", "SO", "D", "AEP", "EXC", "XEL", "ED", "WEC", "PEG",
+    "ES", "FE", "ETR", "EIX", "PPL",
+    # --- Real Estate (15) ---
+    "PLD", "AMT", "EQIX", "CCI", "PSA", "O", "WELL", "SPG", "DLR", "AVB",
+    "EQR", "VTR", "ESS", "MAA", "IRM",
+    # --- Materials, beyond the existing Ecolab (15) ---
+    "LIN", "APD", "SHW", "FCX", "NEM", "DOW", "DD", "PPG", "NUE", "ALB",
+    "CE", "IFF", "MLM", "VMC", "IP",
 ]
 
 # SEC's ticker->CIK file keys on current registered name, so a recent
@@ -127,16 +175,25 @@ CANDIDATE_TICKERS = [
 # which now files as "H2O America"). Add any ticker this script warns
 # about here, verified at sec.gov. Keep in sync with the same-named dict
 # in 02_fundamentals.py once a candidate is actually added to TICKERS.
-MANUAL_CIK_OVERRIDES = {}
+MANUAL_CIK_OVERRIDES = {
+    # American Electric Power: has an active CIK and current SEC filings
+    # (confirmed directly via data.sec.gov/submissions/CIK0000004904.json,
+    # ticker AEP, name "AMERICAN ELECTRIC POWER CO INC"), but is simply
+    # absent from SEC's bulk company_tickers.json -- confirmed by
+    # exact-match lookup returning nothing, not a rename/restructuring
+    # like the SJW/H2O America case. A bulk-file gap, not a real
+    # corporate event; verified USABLE once given this CIK.
+    "AEP": "0000004904",
+}
 
 # Only quarters at/after this matter for the study.
-STUDY_START_YEAR = 2013
+STUDY_START_YEAR = 2003
 
 # What each model feature needs. Lists are alternatives (any one works).
 REQUIREMENTS = {
     # ProfitLoss = consolidated net income including NCI; NetIncomeLoss =
-    # parent-only. Same split as "equity" below (some filers, e.g. ECL,
-    # tag only one of the two consistently).
+    # parent-only. Same split as "equity" below -- ECL tags NetIncomeLoss
+    # for only 22/54 quarters but ProfitLoss for all 54.
     "net_income": ["NetIncomeLoss", "ProfitLoss"],
     # Widened to match EQUITY_PRIORITY in 02_clean_fundamentals.py: a
     # filer that only ever tags the NCI-inclusive variant (e.g. CWT from
@@ -161,6 +218,15 @@ REQUIREMENTS = {
     "capex": [
         "PaymentsToAcquirePropertyPlantAndEquipment",
         "PaymentsToAcquireProductiveAssets",
+        # Added to 02_fundamentals.py TAGS / CAPEX_PRIORITY during the
+        # 8->28 expansion's ROP fix -- belongs in the "already in the
+        # scraper" portion of this list, NOT the "extra candidates" tail
+        # below. It used to sit in that tail, which made CAPEX_ALREADY_IN_SCRAPER
+        # stale and caused this script to print a spurious "ACTION: add
+        # PaymentsToAcquireOtherProductiveAssets" hint for every single
+        # candidate that uses it -- every one of those hints turned out
+        # to be this one already-added tag, not a real gap.
+        "PaymentsToAcquireOtherProductiveAssets",
         "PaymentsForProceedsFromProductiveAssets",
         "PaymentsForCapitalImprovements",
         "PaymentsToAcquireWaterAndWasteWaterSystems",
@@ -176,11 +242,20 @@ REQUIREMENTS = {
         "PaymentsToAcquireUtilityPlant",
         "UtilitiesOperatingExpenseMaintenanceOperations",
         "PaymentsToAcquireRegulatedAssets",
-        "PaymentsToAcquireOtherProductiveAssets",
     ],
 }
 
-MIN_QUARTERS = 30  # below this, coverage is too thin to be useful
+# The first CAPEX_ALREADY_IN_SCRAPER tags in REQUIREMENTS["capex"] mirror
+# what's already live in 02_fundamentals.py's TAGS/CAPEX_PRIORITY; the
+# rest are candidates this checker tests but the scraper doesn't pull
+# yet. Named explicitly (rather than a magic-number slice like
+# REQUIREMENTS["capex"][:11]) so reordering/extending the list above
+# can't silently desync it from what evaluate() treats as "already
+# handled" -- exactly the bug that caused the stale-hint issue fixed
+# just above.
+CAPEX_ALREADY_IN_SCRAPER = 11
+
+MIN_QUARTERS = 48  # below this, coverage is too thin to be useful (12yr, raised from 30/7.5yr for the ~20yr history target)
 
 OUT_DIR = Path("output/tables")
 
@@ -255,7 +330,7 @@ def evaluate(ticker, cik):
     # by priority-fallback (.fillna() across tags), which fills gaps from
     # every tag in the list -- exactly a coverage union. Scoring by best-
     # single-tag alone undercounts a candidate that spreads coverage
-    # across two or more tags.
+    # across two or more tags (e.g. AOS, ROP, ECL).
     results = {}
     for requirement, tags in REQUIREMENTS.items():
         found = {}
@@ -277,7 +352,7 @@ def evaluate(ticker, cik):
         print(f"{requirement:<26} {'PASS' if ok else 'FAIL':<7} {n:>5}  {tag or '(none found)'}")
 
     # Surface any capex tag that isn't already in the scraper.
-    scraper_has = set(REQUIREMENTS["capex"][:11])
+    scraper_has = set(REQUIREMENTS["capex"][:CAPEX_ALREADY_IN_SCRAPER])
     capex_found = results["capex"][2]
     new_tags = [t for t in capex_found if t not in scraper_has]
     if new_tags:
@@ -320,7 +395,16 @@ def main():
     print("02_fundamentals.py and 02_clean_fundamentals.py.")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    # Suffix with -2, -3, ... on a same-day re-run instead of silently
+    # overwriting an earlier run's archived results -- found the hard way
+    # when the 28->~230 pivot's screen landed on the same calendar date as
+    # the still-cited 8->28 expansion's results file and clobbered it (the
+    # old file was only recoverable via git history afterward).
     out_path = OUT_DIR / f"candidate_verification_{date.today():%Y%m%d}.csv"
+    suffix = 2
+    while out_path.exists():
+        out_path = OUT_DIR / f"candidate_verification_{date.today():%Y%m%d}-{suffix}.csv"
+        suffix += 1
     fieldnames = ["ticker", "cik", "verdict"] + list(REQUIREMENTS.keys())
     with out_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

@@ -2,34 +2,40 @@
 # 01_get_data.R
 #
 # Downloads everything that comes from market/macro sources:
-#   - Daily adjusted prices for the stock universe + benchmarks
-#   - Dividend history for the stock universe        [NEW]
+#   - Daily adjusted prices for the stock universe + SPY (the sole benchmark)
+#   - Dividend history for the stock universe, needed for the div_yield feature
 #   - FRED macroeconomic series
 #
 # This script ONLY downloads and saves raw data. All feature engineering
 # happens in 02_features.R, so you can re-derive features without
 # re-hitting the APIs.
 #
-# Prices are truncated for VRT before 2020-02-10: Vertiv traded as a SPAC
-# (GS Acquisition Holdings Corp) before that merger date, and pre-merger
-# rows are trust-NAV noise pinned near $10/share, not real VRT prices --
-# any window spanning the merger would otherwise mix the two.
+# The universe has grown from an initial 8-ticker water-utility set to the
+# 222-ticker S&P 500 universe below, with every added ticker verified via
+# verify_candidate_tickers.py (scripts/verifications.py) first -- see that
+# file and 02_fundamentals.py's TICKERS list (byte-identical, kept in sync
+# by hand) for the full per-sector breakdown and screening rationale. PHO
+# (the original water-sector benchmark) has been removed entirely; SPY is
+# now the sole benchmark for exret_next, so BENCHMARKS is a single-element
+# vector. START_DATE is 2003-01-01 to give the ~20-year study window
+# enough runway for trailing features like 12-month momentum.
 #
 # Dividends come from Yahoo (via tidyquant) rather than SEC XBRL
-# deliberately: Yahoo reports actual ex-dividend CASH events, which is
-# what a shareholder receives. SEC's CommonStockDividendsPerShareDeclared
-# is a *declared* figure that many filers tag only annually, and blending
-# declared-vs-paid across tickers would give div_yield a different
+# deliberately: Yahoo gives actual ex-dividend CASH events, which is what a
+# shareholder receives, whereas SEC's CommonStockDividendsPerShareDeclared
+# is a *declared* figure that many filers tag only annually -- blending
+# declared-vs-paid across tickers would give div_yield an inconsistent
 # meaning per stock. No look-ahead risk: a dividend with ex-date D is
 # public on D.
 #
-# The universe here is 28 tickers (the original 8 water utilities plus
-# 20 water-adjacent industrials), each verified via
-# verify_candidate_tickers.py (scripts/verifications.py) before being
-# added -- see 02_fundamentals.py for the verification rationale.
+# VRT (Vertiv) traded as a SPAC (GS Acquisition Holdings Corp) before its
+# 2020-02-07 merger; pre-merger rows are trust-NAV noise pinned near
+# $10/share, not real VRT prices, and are dropped before writing
+# prices_daily.csv so no feature window spanning the merger gets corrupted
+# by non-Vertiv prices.
 #
 # Output: data/raw/prices_daily.csv
-#         data/raw/dividends_raw.csv   [NEW]
+#         data/raw/dividends_raw.csv
 #         data/raw/macro_fred.csv
 # =============================================================================
 
@@ -46,25 +52,69 @@ library(readr)
 # the model needs -- see EXCLUDED_TICKERS in 02_clean_fundamentals.py
 # for the specific reason for each). BMI (Badger Meter) was added as
 # SJW's replacement; the 20 tickers below PNR..MTZ were added in the
-# 8 -> 28 expansion. All verified via verify_candidate_tickers.py to
-# report all needed tags cleanly -- must stay in sync with TICKERS in
-# 02_fundamentals.py.
+# original 8 -> 28 water-sector expansion, and the 194 tickers below MTZ
+# were added in the subsequent pivot to the full S&P 500 universe. Every
+# addition was verified via verify_candidate_tickers.py to report all
+# needed tags cleanly -- must stay in sync with TICKERS in
+# 02_fundamentals.py (byte-identical list, kept in sync by hand per this
+# repo's convention; see that file for the full per-sector breakdown).
 STOCKS <- c(
   # Original 8-ticker universe
   "AWK", "WTRG", "CWT", "AWR", "XYL", "VRT", "JCI", "BMI",
   # Added in the 8 -> 28 expansion
   "PNR", "MWA", "AOS", "ITT", "IEX", "FELE", "FLS", "DOV", "ECL", "GRC",
-  "ITRI", "MAS", "ROP", "EMR", "PH", "HON", "WMS", "GVA", "PWR", "MTZ"
+  "ITRI", "MAS", "ROP", "EMR", "PH", "HON", "WMS", "GVA", "PWR", "MTZ",
+  # --- Information Technology (32 total: 1 original + 31 new) ---
+  "MSFT", "AAPL", "NVDA", "ORCL", "CRM", "ADBE", "CSCO", "AMD", "QCOM",
+  "TXN", "IBM", "INTU", "AMAT", "ADI", "LRCX", "KLAC", "MU", "SNPS",
+  "CDNS", "ADSK", "MCHP", "ON", "TER", "WDC", "STX", "NTAP", "TYL",
+  "PTC", "SWKS", "GRMN", "ZBRA",
+  # --- Health Care (26 total, all new) ---
+  "JNJ", "UNH", "LLY", "MRK", "PFE", "TMO", "ABT", "DHR", "BMY", "AMGN",
+  "GILD", "CVS", "ELV", "HUM", "SYK", "BSX", "ISRG", "ZBH", "BDX", "BAX",
+  "VRTX", "BIIB", "MCK", "COR", "HCA", "DVA",
+  # --- Financials (24 total, all new) ---
+  "C", "GS", "MS", "BNY", "SCHW", "SPGI", "MCO", "ICE", "AON", "MRSH",
+  "AJG", "ALL", "PGR", "HIG", "STT", "FITB", "AXP", "COF", "NDAQ",
+  "MSCI", "FDS", "CBOE", "NTRS", "WTW",
+  # --- Consumer Discretionary (24 total, all new) ---
+  "AMZN", "TSLA", "HD", "MCD", "LOW", "SBUX", "TJX", "ORLY", "AZO",
+  "ROST", "YUM", "MAR", "HLT", "GM", "APTV", "BBY", "DHI", "PHM", "NVR",
+  "WHR", "TSCO", "ULTA", "GPC", "CMG",
+  # --- Communication Services (10 total, all new) ---
+  "NFLX", "T", "VZ", "TMUS", "EA", "TTWO", "OMC", "LYV", "MTCH", "SIRI",
+  # --- Industrials (36 total: 22 original + 14 new) ---
+  "CAT", "DE", "UNP", "FDX", "BA", "LMT", "RTX", "GD", "NOC", "CSX",
+  "NSC", "WM", "RSG", "GE",
+  # --- Consumer Staples (15 total, all new) ---
+  "PG", "KO", "PEP", "COST", "WMT", "PM", "MO", "MDLZ", "CL", "KMB",
+  "GIS", "ADM", "CAG", "CLX", "CHD",
+  # --- Energy (12 total, all new) ---
+  "CVX", "EOG", "SLB", "MPC", "VLO", "OXY", "WMB", "KMI", "OKE", "DVN",
+  "HAL", "TRGP",
+  # --- Utilities (17 total: 4 original water utilities + 13 new) ---
+  "AEP", "DUK", "SO", "D", "EXC", "XEL", "ED", "PEG", "ES", "FE", "ETR",
+  "EIX", "PPL",
+  # --- Real Estate (13 total, all new) ---
+  "AMT", "EQIX", "CCI", "PSA", "O", "WELL", "AVB", "EQR", "VTR", "IRM",
+  "UDR", "HST", "BXP",
+  # --- Materials (13 total: 1 original + 12 new) ---
+  "APD", "SHW", "FCX", "NEM", "PPG", "NUE", "ALB", "CE", "IFF", "MLM",
+  "VMC", "IP"
 )
 
-# PHO is the core benchmark (excess returns are measured against it).
-# SPY is kept for context/reporting, not for the target variable.
-BENCHMARKS <- c("PHO", "SPY")
+# SPY is the sole benchmark: exret_next is a ticker's next-quarter return
+# minus SPY's next-quarter return. PHO (the original water-sector
+# benchmark) has been removed entirely, not kept even as a passive
+# column -- this project no longer tests a single-sector hypothesis.
+BENCHMARKS <- c("SPY")
 
 # Start early enough that a 12-month momentum feature is computable for
-# the first quarter of the actual study window (2015). 252 trading days
-# of lookback needs roughly 1.5 years of runway to be safe.
-START_DATE <- "2013-01-01"
+# the first quarter of the actual study window (2006, per the ~20-year
+# S&P-500-universe history target) with runway to spare. 252 trading
+# days of lookback needs roughly 1.5 years of runway to be safe; 2003
+# gives the 2006 study start 3 years of it.
+START_DATE <- "2003-01-01"
 END_DATE   <- Sys.Date()
 
 FRED_SERIES <- c(
@@ -152,10 +202,10 @@ message("Saved ", nrow(prices_daily), " price rows.")
 # dividend, then divides by the raw close price.
 #
 # KNOWN ENVIRONMENT ISSUE: this step has been observed to crash the R
-# session outright (segfault, not a catchable error) when parsing
-# Yahoo's dividend response via quantmod::getDividends -- root-caused to
-# an R/jsonlite bug, not rate-limiting, the ticker list, or this code.
-# If this step fails or returns no data, run
+# session outright (segfault, not a catchable error) when parsing Yahoo's
+# dividend response via quantmod::getDividends -- root-caused to an
+# R/jsonlite bug unrelated to rate-limiting, the ticker list, or this
+# code. If this step fails or returns no data, run
 # `python scripts/get_dividends_fallback.py` instead, which hits the
 # identical Yahoo source and writes the identical output schema.
 

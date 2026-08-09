@@ -19,54 +19,98 @@ PIPELINE
 Input:  data/raw/fundamentals_raw.csv
 Output: data/processed/fundamentals_clean.csv
 
-Several fields are resolved by PRIORITY across more than one SEC tag
-rather than a single fixed tag name, because individual filers are
-inconsistent about which tag they use:
-  - StockholdersEquity (EQUITY_PRIORITY): plain StockholdersEquity wins
-    when a filer reports it, falling back to
-    StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest
-    otherwise. CWT, for example, stops tagging the plain version after
-    2021-03-31 -- without this fallback, roe/debt_to_equity (and
-    Liabilities, always derived here via Assets - StockholdersEquity
-    since CWT never tags Liabilities directly) would forward-fill a
-    stale pre-2021 value indefinitely.
-  - NetIncomeLoss (NET_INCOME_PRIORITY): plain NetIncomeLoss
-    (parent-only) wins when reported, falling back to ProfitLoss
-    (consolidated, including NCI) otherwise. Ecolab, for example, tags
-    NetIncomeLoss for only a fraction of its quarters but ProfitLoss for
-    all of them.
-  - CapEx (CAPEX_PRIORITY): several payments-to-acquire tags are tried
-    in priority order, never summed, since filers split capex reporting
-    across multiple tags with only partial overlap (Roper Technologies,
-    for example, needs two different tags to cover its full history).
-  - shares_outstanding is cross-checked against
-    EntityCommonStockSharesOutstanding for a >10x unit-scale mismatch
-    (see compute_features()) -- individual filers have been observed to
-    tag a share count in the wrong scale (e.g. thousands instead of raw
-    shares) for a single filing that a later restatement corrects. Left
-    uncaught, this kind of error can send pb_ratio/fcf_yield off by
-    orders of magnitude for that one quarter, which is more than enough
-    to distort a model's training fit for the whole panel. This is a
-    generic filer-tagging risk, not specific to any one ticker, so the
-    check runs panel-wide.
-
-Derived features:
+FEATURES COMPUTED HERE
   current_ratio    = AssetsCurrent / LiabilitiesCurrent
   asset_growth     = Assets / Assets(4 quarters ago) - 1
   ni_growth        = NetIncomeLoss TTM YoY growth
   capex_intensity  = CapEx TTM / Assets
+asset_turnover (Revenues TTM / Assets) was considered and dropped:
+Revenue coverage is the weakest column in this dataset -- TTM revenue
+needs four CONSECUTIVE tagged quarters, and AWK in particular rarely has
+them (70% of its asset_turnover would have been a stale forward-filled
+value, not a fresh observation) -- so it would have been a near-constant
+column unable to move the Broker Test's cross-sectional ranking for that
+ticker anyway. The same reasoning excludes operating_margin below.
 
-(asset_turnover, Revenues TTM / Assets, was tried and dropped: TTM
-revenue needs four CONSECUTIVE tagged quarters, and at least one ticker
-in this universe rarely has them, leaving asset_turnover mostly a stale
-forward-filled value rather than a fresh observation for that name --
-removed rather than kept as a near-constant column that couldn't move
-the Broker Test's cross-sectional ranking anyway.)
+FILER TAG-RESOLUTION PATTERN
+Several fields are resolved by PRIORITY rather than a fixed single tag,
+because individual filers are inconsistent about which XBRL tag they use
+for the same underlying concept, and the two variants can genuinely
+differ once a filer carries a noncontrolling interest: StockholdersEquity
+(EQUITY_PRIORITY: plain StockholdersEquity preferred, falling back to the
+NCI-inclusive variant for filers like CWT that stop tagging the plain
+one), NetIncomeLoss (NET_INCOME_PRIORITY: parent-only preferred, falling
+back to ProfitLoss for filers like ECL that tag the parent-only figure
+only sporadically), and CapEx (CAPEX_PRIORITY, unioned across component
+tags for filers like ROP that split reporting across two tags with
+little overlap). This pattern is never a blind alias -- see EQUITY_PRIORITY
+and NET_INCOME_PRIORITY's definitions for the resolution order.
 
-The universe here is 28 tickers: the original 8 regulated water
-utilities plus 20 water-adjacent names, each verified via
-verify_candidate_tickers.py before being added; a couple of candidates
-(WTS, CR) were considered and excluded -- see EXCLUDED_TICKERS below.
+TICKER UNIVERSE
+The universe grew from an initial 8-ticker water-utility set through a
+28-ticker water/infrastructure-adjacent expansion to the current
+222-ticker S&P 500 universe. EXCLUDED_TICKERS below is the
+defense-in-depth reject list (also re-checked, more thoroughly, by
+verify_candidate_tickers.py before a ticker is ever added). STUDY_START
+is 2003-01-01, in lockstep with 01_get_data.R's START_DATE, to give
+TTM/lag calculations runway before 01a_ratios.R's panel-level
+STUDY_START (2010-01-01). flag_extreme_de (|debt_to_equity| > 10) fires
+somewhat more often now that the universe includes Financials/REITs,
+which legitimately run much higher leverage than industrials -- expected,
+since this flags rows for review rather than dropping them, not a sign
+of a bug.
+
+FILER UNIT-SCALE / TAGGING-ERROR SAFETY NETS
+compute_features() includes several checks for individual filers tagging
+a field at the wrong scale or with a wrong value in one filing --
+observed repeatedly at this ticker count, not a one-off:
+  - shares_outstanding is cross-checked against
+    EntityCommonStockSharesOutstanding for a >10x unit-scale mismatch,
+    arbitrated by local_median_scale() (whichever candidate is closer to
+    that ticker's own nearby-quarter scale wins) rather than a fixed
+    "always trust the cover page" rule -- several tickers' own cover-page
+    figures turned out to be the ones off by exactly 10^6 for one filing,
+    which a fixed rule would blindly have preferred over a good
+    priority-tag value. shares_outstanding also has an ABSOLUTE floor:
+    since this dataset is S&P 500 constituents only, no real company here
+    has fewer than 1,000,000 shares outstanding, so anything below that
+    is nulled unconditionally -- needed because a SUSTAINED multi-year
+    tagging error (a filer reporting bare millions instead of raw shares
+    for years at a stretch) contaminates even that ticker's own recent
+    history, defeating any check whose baseline is the ticker's own
+    nearby quarters. The same floor incidentally catches an outright
+    impossible negative share count.
+  - Equity cross-tag correction: when both EQUITY_PRIORITY tags are
+    present in the same filing and disagree by >10x, the value closer to
+    that ticker's own historical scale is preferred, instead of blindly
+    keeping the priority-order winner -- some filers tag one equity
+    variant wildly wrong in the very same filing that correctly tags the
+    other variant, which the priority-order rule alone can't catch since
+    it only fills gaps, never overrides a present-but-wrong value.
+  - flag_scale_outliers(): a generic per-ticker magnitude check
+    (comparison against a rolling median of that ticker's own nearby
+    quarters, flagging >50x deviation either direction) applied to
+    Assets, a directly-tagged Liabilities, and StockholdersEquity once no
+    same-filing alternate tag exists to prefer instead. This catches
+    cases where a filer's Equity AND Liabilities tags are wrong at the
+    same wrong scale in the same quarter, so the Assets = Liabilities +
+    Equity identity holds exactly and can't itself catch the error. Nulls
+    rather than substitutes a number, since there's no trustworthy
+    same-filing alternate for these -- forward-fill downstream carries
+    the prior good quarter forward, same as any other gap.
+Net effect, verified via a full systematic sweep of every predictor's
+most extreme values after these fixes: no remaining absurd
+(many-orders-of-magnitude) values in pb_ratio/fcf_yield/roe/
+debt_to_equity/capex_intensity/asset_growth. Everything left at the
+extreme end is real: mature companies with small/negative book equity
+from sustained share buybacks, and genuine one-time events (an
+acquisition that jumps Assets several-fold in one real, well-documented
+quarter; a SPAC-to-operating-company transition; a capital-intensive
+startup's early high capex intensity). If a future run surfaces a new
+many-orders-of-magnitude outlier, trace it back to the raw XBRL fact
+(data/raw/fundamentals_raw.csv) and that ticker's own surrounding
+filings before assuming it's real -- that is what caught every case
+resolved so far.
 
 WHY THE REMAINING FOUR ARE COMPUTED HERE AND NOT IN 02_features.R
 They depend only on fundamentals, so they must be computed on the
@@ -99,9 +143,10 @@ import pandas as pd
 RAW_PATH = Path("data/raw/fundamentals_raw.csv")
 OUT_PATH = Path("data/processed/fundamentals_clean.csv")
 
-# Start earlier than the 2015 study window so trailing-twelve-month
-# calculations and forward-fills have history to work with.
-STUDY_START = "2013-01-01"
+# Starts earlier than 01a_ratios.R's panel-level STUDY_START (2010-01-01)
+# so trailing-twelve-month calculations and forward-fills have history to
+# work with.
+STUDY_START = "2003-01-01"
 STUDY_END = "2026-12-31"
 
 # Excluded regardless of what's in the raw file: MSEX's own SEC filings
@@ -123,7 +168,58 @@ STUDY_END = "2026-12-31"
 # spinoff -- well under both the verifier's MIN_QUARTERS=30 and the
 # project's >=10-year trading-history screen. Also listed here as
 # defence-in-depth in case a stale raw file still contains its rows.
-EXCLUDED_TICKERS = {"MSEX", "SJW", "WTS", "CR"}
+#
+# The 70 tickers below MTZ are the NOT USABLE rejects from the 28 -> 222
+# S&P-500-pivot screen (verify_candidate_tickers.py) -- per-ticker
+# rationale isn't repeated here at this scale the way it is for the
+# original 4; the two dominant, real, structural failure patterns were:
+#   (a) capex: banks, insurers, and several REITs (JPM, BAC, WFC, USB,
+#       PNC, TFC, MET, PRU, AFL, CB, AIG, TRV, PLD, DLR, KIM, FRT, CPT,
+#       REG, ARE, VICI among them) structurally don't tag a PP&E-style
+#       capex figure the way an industrial or utility does -- the exact
+#       Financials/REITs gap anticipated ahead of this pivot;
+#   (b) too-new-under-current-CIK: a household name whose CURRENT SEC
+#       registrant is newer than the company itself due to a merger,
+#       spinoff, or redomiciliation -- e.g. GOOGL (Alphabet's 2015
+#       reorg), MDT (Medtronic plc's 2015 Ireland redomiciliation), DIS
+#       (2019 registrant change), LIN (Linde plc's 2018 merger), DOW/DD
+#       (2019 DowDuPont spinoffs), KHC (2015 Kraft-Heinz merger), CI
+#       (Cigna Group holdco), XOM/BLK (newly-registered holding-company
+#       CIKs found live during this exact screen) -- the same SJW/CR
+#       lesson this script's docstring describes, just recurring at
+#       S&P 500 scale.
+# EXCLUDED_TICKERS is a defense-in-depth guard against a stale raw file,
+# not the primary control -- 02_fundamentals.py's TICKERS never fetches
+# these in the first place.
+_SP500_PIVOT_CAPEX_OR_STRUCTURAL_REJECTS = {
+    "ABBV", "ACN", "AFL", "AIG", "AVGO", "BAC", "BKNG", "BKR", "BLK",
+    "CB", "CHTR", "CI", "CMCSA", "CME", "COP", "DD", "DIS", "DLR",
+    "DOW", "ESS", "EXPE", "F", "FANG", "GOOGL", "HSY", "JPM", "KHC",
+    "LEN", "LIN", "MAA", "MDT", "MET", "META", "MKC", "NEE", "NKE",
+    "NXPI", "PLD", "PNC", "PRU", "PSX", "REGN", "SPG", "STZ", "SYY",
+    "TAP", "TFC", "TRV", "TSN", "UPS", "USB", "WBD", "WEC", "WFC", "XOM",
+    # Supplemental round (targeting the thin Financials/Real Estate/
+    # Communication Services sectors): same two failure patterns.
+    "V", "MA", "PYPL", "SYF", "BX", "KKR", "REG", "ARE", "KIM", "FRT",
+    "CPT", "INVH", "VICI", "FOXA", "NWSA",
+}
+
+# Distinct category from the above: these were considered but returned
+# NO CIK FOUND with no renamed successor findable in SEC's bulk ticker
+# file, consistent with each having been acquired/taken private since
+# (HPE-Juniper, Omnicom-Interpublic, Chevron-Hess, Mars-Kellanova,
+# Capital One-Discover, Skydance-Paramount) and no longer filing as
+# independent SEC registrants -- not a tagging/history gap, just no
+# longer an independently investable stock. Listed separately from
+# _SP500_PIVOT_CAPEX_OR_STRUCTURAL_REJECTS since the failure mode (and
+# what a future contributor should conclude from it) is different.
+_SP500_PIVOT_DELISTED_OR_ACQUIRED = {"JNPR", "IPG", "HES", "K", "DFS", "PARA"}
+
+EXCLUDED_TICKERS = (
+    {"MSEX", "SJW", "WTS", "CR"}
+    | _SP500_PIVOT_CAPEX_OR_STRUCTURAL_REJECTS
+    | _SP500_PIVOT_DELISTED_OR_ACQUIRED
+)
 
 # Flow facts cover a period (income statement, cash flow statement) and
 # need duration filtering. Everything else is an instant balance-sheet
@@ -493,6 +589,97 @@ def ttm_sum(df, col):
     return total
 
 
+def local_median_scale(values, tickers, ends, window=13, min_periods=5):
+    """
+    Centered rolling median of `values`, computed within each ticker's
+    own chronologically-sorted history -- shared by flag_scale_outliers()
+    below and the equity cross-tag correction in compute_features(),
+    both of which need "what's this ticker's normal scale RIGHT NOW"
+    rather than "what's this ticker's normal scale ever" (see
+    flag_scale_outliers()'s docstring for why local beats global here).
+    """
+    values = pd.to_numeric(values, errors="coerce")
+    frame = pd.DataFrame({"ticker": tickers.values, "end": ends.values, "val": values.abs()},
+                          index=values.index)
+    ordered = frame.sort_values(["ticker", "end"])
+    local_median = ordered.groupby("ticker")["val"].transform(
+        lambda s: s.rolling(window, center=True, min_periods=min_periods).median()
+    )
+    return local_median.reindex(frame.index)
+
+
+def flag_scale_outliers(values, tickers, ends, label, factor=50, window=13, min_periods=5):
+    """
+    Null out values that are implausible relative to that SAME ticker's
+    own NEARBY-IN-TIME quarters -- a filer unit-scale/tagging error, the
+    same failure category as the shares_outstanding vs
+    EntityCommonStockSharesOutstanding check in compute_features(), just
+    for a field with no reliable same-filing alternate tag to cross-check
+    against (Assets, a directly-tagged Liabilities, or StockholdersEquity
+    once no better same-filing substitute exists -- see the equity
+    cross-tag correction for the case where one does).
+
+    Found via ICE (StockholdersEquity tagged as exactly 10 for two
+    consecutive 2013 quarters -- confirmed wrong against every later
+    filing restating ~$12.5B for the same periods) and KMB (Assets tagged
+    as 18997/19209, i.e. off by exactly 10^6, reported in thousands
+    instead of dollars for one 2010 filing).
+
+    DELIBERATELY LOCAL, NOT GLOBAL: compares each value to a CENTERED
+    ROLLING median of that ticker's own chronologically nearby quarters
+    (window=13 by default, i.e. roughly 3 years of quarters on each
+    side), not a single all-time median across its full history. A
+    global median was tried first and over-flagged real, gradual
+    growth/shrinkage as if it were a bug -- VRT's pre-2020-merger SPAC
+    shell genuinely had ~$25,000 in assets (consistently reported across
+    three separate filings, not a typo) before becoming a real operating
+    company; NFLX/TSLA/AMZN were all genuinely tiny in their first few
+    XBRL-era quarters compared to their present-day scale. Those early
+    values are perfectly consistent with their OWN neighboring quarters
+    at the time, so a local window correctly leaves them alone -- only a
+    quarter that's an order-of-magnitude spike-and-revert relative to the
+    quarters immediately around it (real growth doesn't look like that;
+    ICE's two consecutive bad quarters and KMB's one do) gets nulled.
+    window=13 (~13 quarters, both sides combined with the point itself)
+    is large enough that 1-2 contaminated quarters can't drag their own
+    local median toward themselves (median is robust up to ~50%
+    contamination; this dataset has never shown more than 2 consecutive
+    bad quarters for one ticker/column).
+
+    A per-ticker, local baseline also means a company with a genuinely
+    small or negative StockholdersEquity from years of share buybacks
+    (Boeing, McKesson, Colgate, O'Reilly, Marriott, ...) is never
+    flagged: its own nearby quarters are small too, so its own small
+    values don't look anomalous against them -- this is what
+    distinguishes a real economic outlier (flagged elsewhere by
+    flag_negative_equity/flag_extreme_de, not dropped) from a filer's
+    tagging error (nulled here, since there's no trustworthy value to
+    substitute).
+
+    Nulls rather than guesses a corrected number, per this project's
+    missing-!=-zero/never-fabricate convention.
+    """
+    values = pd.to_numeric(values, errors="coerce")
+    local_median = local_median_scale(values, tickers, ends, window=window, min_periods=min_periods)
+    ratio = values.abs() / local_median
+    bad = (
+        values.notna()
+        & local_median.notna()
+        & (local_median > 0)
+        & ((ratio > factor) | (ratio < 1 / factor))
+    )
+    n_bad = int(bad.sum())
+    if n_bad:
+        rows = ", ".join(f"{t}@{e}" for t, e in zip(tickers[bad], ends[bad]))
+        print(
+            f"WARNING: {n_bad} {label} value(s) off by >{factor}x vs that "
+            f"ticker's own NEARBY-QUARTER history (likely a filer "
+            f"unit-scale/tagging error, not real growth/shrinkage) -- "
+            f"nulled rather than guessed at. Rows: {rows}"
+        )
+    return values.mask(bad)
+
+
 def compute_features(df):
     """
     Compute the fundamentals-only feature set.
@@ -516,9 +703,7 @@ def compute_features(df):
         if col in df.columns:
             shares = df[col] if shares is None else shares.fillna(df[col])
 
-    # UNIT-SCALE SANITY CHECK (found during the 8 -> 28 expansion,
-    # 2026-08-08, root-caused while investigating a bagged-MARS train
-    # R^2 of -190): ROP's FY2016 10-K (filed 2017-02-27) tags
+    # UNIT-SCALE SANITY CHECK: ROP's FY2016 10-K (filed 2017-02-27) tags
     # CommonStockSharesOutstanding for end=2016-12-31 as 101672 -- i.e.
     # in THOUSANDS of shares -- while ROP's own later FY2017 10-K (filed
     # 2018-02-23) restates the identical period as 101672000, in raw
@@ -528,33 +713,98 @@ def compute_features(df):
     # really is what the market saw first. Left unchecked, the
     # 1000x-too-small share count sends book_value_per_share (hence
     # pb_ratio) ~1000x too low and market cap (hence fcf_yield) ~1000x
-    # too high for that single quarter -- which alone was enough to blow
-    # up bagged-MARS's bagged predictions by orders of magnitude via one
-    # bootstrap-resampled training row. This is a generic filer-tagging
+    # too high for that single quarter. This is a generic filer-tagging
     # risk (any ticker/quarter could hit it), not a ROP-specific patch,
     # so the check applies panel-wide: cross-check the priority-picked
     # share count against EntityCommonStockSharesOutstanding (a
-    # cover-page fact -- a single scalar per filing, not observed to
-    # have this scale problem anywhere in this dataset). Where the two
-    # differ by more than 10x, trust the cover-page figure instead; it
-    # is confirmed correctly scaled for the SAME filing in the case that
-    # motivated this check (ROP's cover page reports 101,434,201 shares
-    # as of 2017-02-24, filed 2017-02-27 -- the very filing that tagged
-    # CommonStockSharesOutstanding as 101672).
+    # cover-page fact).
+    #
+    # That cross-check can't simply always trust the cover-page figure
+    # on disagreement, though: several tickers' own
+    # EntityCommonStockSharesOutstanding tag is corrupted by the same
+    # off-by-10^6 filer error for one filing (e.g. AJG's cover page
+    # reports 191,469,000,000,000 instead of ~191,469,000 for its
+    # 2020-06-30 10-Q, confirmed by checking that ticker's own
+    # surrounding cover-page values, which are all normal). Always
+    # preferring the cover page would blindly overwrite a GOOD
+    # priority-tag value with a BAD cover-page value in those cases --
+    # the exact bug this check exists to prevent. Fixed by arbitrating
+    # with local_median_scale() (same mechanism as the equity cross-tag
+    # correction below) instead of always preferring the cover page:
+    # whichever of the two candidates is closer to that ticker's own
+    # nearby-quarter share-count scale wins. Robust in both directions --
+    # a corrupted priority tag or a corrupted cover-page tag both get
+    # caught, since the arbiter is that ticker's own recent history, not
+    # a fixed "always trust X" rule.
     if "EntityCommonStockSharesOutstanding" in df.columns:
         cover = df["EntityCommonStockSharesOutstanding"]
         ratio = shares / cover
-        bad_scale = shares.notna() & cover.notna() & ((ratio > 10) | (ratio < 0.1))
-        n_bad = int(bad_scale.sum())
+        disagree = shares.notna() & cover.notna() & ((ratio > 10) | (ratio < 0.1))
+        n_bad = int(disagree.sum())
         if n_bad:
+            ticker_scale = local_median_scale(shares, df["ticker"], df["end"])
+            prefer_cover = disagree & (
+                (cover.abs() - ticker_scale).abs() < (shares.abs() - ticker_scale).abs()
+            )
+            n_prefer_cover = int(prefer_cover.sum())
             print(
                 f"WARNING: {n_bad} shares_outstanding value(s) off by >10x vs "
-                f"EntityCommonStockSharesOutstanding (likely a units error in "
-                f"the underlying filing) -- using the cover-page figure "
-                f"instead. Tickers affected: "
-                f"{sorted(df.loc[bad_scale, 'ticker'].unique())}"
+                f"EntityCommonStockSharesOutstanding (a units error in ONE of "
+                f"the two figures, not necessarily the cover page) -- "
+                f"substituting whichever is closer to that ticker's own "
+                f"nearby-quarter scale: cover-page figure used for "
+                f"{n_prefer_cover} row(s), priority-tag figure kept for "
+                f"{n_bad - n_prefer_cover} row(s). Rows using the cover page: "
+                + ", ".join(
+                    f"{t}@{e}" for t, e in
+                    zip(df.loc[prefer_cover, "ticker"], df.loc[prefer_cover, "end"])
+                )
             )
-            shares = shares.mask(bad_scale, cover)
+            shares = shares.mask(prefer_cover, cover)
+
+    # Generic safety net, same as Assets/Liabilities/StockholdersEquity
+    # below: catches a corrupted share count with NO alternate tag at all
+    # to cross-check against for that specific period (MAR's 2010-03-26
+    # cover-page value is off by 10^6 with no CommonStockSharesOutstanding/
+    # CommonStockSharesIssued reported for that exact date, so the
+    # cross-tag correction just above has nothing to arbitrate against).
+    shares = flag_scale_outliers(shares, df["ticker"], df["end"], "shares_outstanding")
+
+    # ABSOLUTE PLAUSIBILITY FLOOR, on top of the two relative checks above.
+    # Found via SYK (Stryker): CommonStockSharesOutstanding gets reported
+    # in bare millions instead of raw shares (391, 381, 380, 378, ...
+    # instead of 391000000, 381000000, ...) for a SUSTAINED multi-year
+    # stretch (2011-09-30 through 2015-03-31), not an isolated quarter --
+    # confirmed by EntityCommonStockSharesOutstanding staying correctly
+    # scaled (~370-400M) for SYK's entire 2009-2026 history, so the
+    # truncated tag really is wrong, not a real trajectory. A SUSTAINED
+    # error defeats both checks above: the local window in
+    # flag_scale_outliers() ends up mostly full of the same truncated
+    # value, so nothing looks locally anomalous, and the cross-tag
+    # tie-breaker's `ticker_scale` reference is itself computed from the
+    # same contaminated `shares` series. No relative check can fix that;
+    # only an absolute one can. This dataset is, by construction, S&P 500
+    # constituents only -- there is no real company in
+    # this universe with fewer than 1 million shares outstanding, so a
+    # value below that (this floor also happens to catch OXY's one
+    # impossible NEGATIVE share count, -891,624,558, found during the
+    # same sweep) is unambiguous, regardless of what its own local
+    # history looks like.
+    implausible = shares.notna() & (shares < 1_000_000)
+    n_implausible = int(implausible.sum())
+    if n_implausible:
+        rows = ", ".join(
+            f"{t}@{e}" for t, e in
+            zip(df.loc[implausible, "ticker"], df.loc[implausible, "end"])
+        )
+        print(
+            f"WARNING: {n_implausible} shares_outstanding value(s) below the "
+            f"absolute 1,000,000-share floor for this S&P-500-only universe "
+            f"(likely a sustained thousands/millions-scale filer error, or "
+            f"an impossible negative value) -- nulled rather than guessed "
+            f"at. Rows: {rows}"
+        )
+        shares = shares.mask(implausible)
 
     df["shares_outstanding"] = shares
 
@@ -579,8 +829,77 @@ def compute_features(df):
         print("WARNING: no StockholdersEquity tag (plain or NCI-inclusive) found")
         df["StockholdersEquity"] = pd.NA
     else:
+        # EQUITY CROSS-TAG CORRECTION: the priority-fill loop
+        # above only reaches for EQUITY_PRIORITY[1] when EQUITY_PRIORITY[0]
+        # is MISSING (.fillna() fills gaps, it never overrides a
+        # present-but-wrong value) -- so a filer that tags BOTH in the same
+        # filing but gets the first one wrong slips through untouched.
+        # Root-caused via OXY's FY2018 10-K (filed 2019-02-21): plain
+        # StockholdersEquity tagged -172,000,000 in the SAME filing that
+        # correctly tags StockholdersEquityIncludingPortionAttributable
+        # ToNoncontrollingInterest at 21,330,000,000 -- OXY's own later
+        # filings restate plain StockholdersEquity for that exact period to
+        # 21,330,000,000, confirming the NCI-inclusive figure was right.
+        # MCHP's FY2017 10-K shows the identical pattern (-14,378,000 vs
+        # 3,270,711,000). Both tags are same-filing facts, so preferring
+        # whichever is closer to that ticker's own historical scale is
+        # look-ahead-safe -- the correction doesn't reach into a later
+        # filing, it just stops trusting a present-but-implausible tag over
+        # an equally-contemporaneous one that isn't.
+        if len(EQUITY_PRIORITY) == 2 and all(c in df.columns for c in EQUITY_PRIORITY):
+            tag_a = pd.to_numeric(df[EQUITY_PRIORITY[0]], errors="coerce")
+            tag_b = pd.to_numeric(df[EQUITY_PRIORITY[1]], errors="coerce")
+            both_present = tag_a.notna() & tag_b.notna()
+            tag_ratio = tag_a / tag_b
+            disagree = both_present & ((tag_ratio.abs() > 10) | (tag_ratio.abs() < 0.1))
+            if disagree.any():
+                ticker_scale = local_median_scale(equity, df["ticker"], df["end"])
+                prefer_b = disagree & (
+                    (tag_b.abs() - ticker_scale).abs()
+                    < (tag_a.abs() - ticker_scale).abs()
+                )
+                n_swapped = int(prefer_b.sum())
+                if n_swapped:
+                    rows = ", ".join(
+                        f"{t}@{e}" for t, e in
+                        zip(df.loc[prefer_b, "ticker"], df.loc[prefer_b, "end"])
+                    )
+                    print(
+                        f"WARNING: {n_swapped} {EQUITY_PRIORITY[0]} value(s) disagree "
+                        f"with {EQUITY_PRIORITY[1]} by >10x in the same filing -- "
+                        f"substituting the tag closer to that ticker's own "
+                        f"historical scale. Rows: {rows}"
+                    )
+                    equity = equity.mask(prefer_b, tag_b)
+                    equity_source = equity_source.mask(
+                        prefer_b, EQUITY_PRIORITY[1] + "_corrected"
+                    )
+
+        # Generic safety net for single-tag scale errors with no same-
+        # filing alternate to cross-check against (ICE: StockholdersEquity
+        # tagged as exactly 10, twice, vs a ~$12.5B historical scale, with
+        # no NCI-inclusive tag reported for either bad quarter to catch it
+        # the way the correction above catches OXY/MCHP).
+        equity = flag_scale_outliers(equity, df["ticker"], df["end"], "StockholdersEquity")
         df["StockholdersEquity"] = equity
     df["equity_source_tag"] = equity_source
+
+    # Same generic check applied to Assets and to a DIRECTLY-tagged
+    # Liabilities, before either feeds the derivation fallback below --
+    # found via KMB (Assets tagged 18997/19209, i.e. off by exactly 10^6,
+    # reported in thousands instead of dollars, for one 2010 filing) and
+    # ICE (whose own Liabilities tag was ALSO wrong at 1,329,000 for the
+    # same bad 2013-09-30 quarter as its StockholdersEquity=10 -- the
+    # filer's error scaled Assets/Liabilities/Equity down together and
+    # consistently WITHIN that filing, so the Assets=Liabilities+Equity
+    # identity holds exactly at the wrong scale and can't catch it; only
+    # comparing against that ticker's own other quarters can).
+    if "Assets" in df.columns:
+        df["Assets"] = flag_scale_outliers(df["Assets"], df["ticker"], df["end"], "Assets")
+    if "Liabilities" in df.columns:
+        df["Liabilities"] = flag_scale_outliers(
+            df["Liabilities"], df["ticker"], df["end"], "Liabilities (directly tagged)"
+        )
 
     # Liabilities is tagged by only a minority of these filers, but the
     # accounting identity Assets = Liabilities + Equity always holds.

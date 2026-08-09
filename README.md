@@ -1,46 +1,27 @@
-# Quarterly Stock Return Prediction (Water Sector)
+# Quarterly Stock Return Prediction
 
-Undergraduate Economics + Computer Science ML/Data Analytics course
-project. Predicts a stock's next-quarter return in excess of PHO
-(Invesco Water Resources ETF) from a mix of technical and fundamental
-predictors, using Lasso, Partial Least Squares (PLS), and Bagged
-Regression Splines.
+An Economics + Computer Science ML/Data Analytics course project. The
+universe just pivoted from a small water-sector set to the full S&P 500:
+222 tickers spanning all 11 GICS sectors, screened via
+`scripts/verifications.py` before being added. Models are Partial Least
+Squares (PLS), Random Forest, and Gradient Boosted Regression Trees
+(GBRT), predicting each ticker's next-quarter return relative to SPY
+(`exret_next`).
 
-**Universe:** 28 tickers -- the original 8 regulated water utilities
-(AWK, WTRG, CWT, AWR, XYL, VRT, JCI, BMI) plus 20 water-adjacent
-equipment/infrastructure/industrial names, each screened via
-`scripts/verifications.py` before being added.
+## Pipeline
 
-**Target variable:** `exret_next` = a ticker's next-quarter return minus
-PHO's next-quarter return.
+1. `scripts/01_get_data.R` -- daily prices, dividends, FRED macro series
+2. `scripts/02_fundamentals.py` -- SEC EDGAR fundamentals scrape
+3. `scripts/02_clean_fundamentals.py` -- cleans and derives ratios
+4. `scripts/01a_ratios.R` -- builds the quarterly modelling panel
+5. `scripts/03_models.R` -- fits and evaluates PLS / Random Forest / GBRT
 
-**No look-ahead bias:** fundamentals are joined to a quarter by SEC
-filing date, not the fiscal period they describe, and all technical
-features use trailing windows only. Validation is a strict time-based
-split (train on quarters before 2023-01-01, test from 2023-01-01
-onward) rather than random cross-validation.
+Run the R scripts with `Rscript <path>` and the Python scripts with
+`python3 <path>`, in the order above. Fundamentals scraping requires the
+`SEC_USER_AGENT` environment variable to be set to a real contact string
+(SEC EDGAR rejects unidentified traffic).
 
 ## Requirements
 
-SEC EDGAR requires a real contact string in the User-Agent header.
-Set it before running anything that hits SEC EDGAR:
-
-```
-export SEC_USER_AGENT="Your Name your.email@example.com"
-```
-
-## Running it
-
-There is no single runner script yet -- run each stage in order:
-
-```
-Rscript scripts/01_get_data.R
-python scripts/02_fundamentals.py
-python scripts/02_clean_fundamentals.py
-Rscript scripts/01a_ratios.R
-Rscript scripts/03_models.R
-```
-
-If the dividend-download step in `01_get_data.R` fails or returns no
-rows, run `python scripts/get_dividends_fallback.py` instead -- it
-hits the same Yahoo Finance source and writes the same output schema.
+R: `tidyquant`, `dplyr`, `readr`, `pls`, `randomForest`, `gbm`.
+Python 3: `requests`, `pandas`, `numpy`.

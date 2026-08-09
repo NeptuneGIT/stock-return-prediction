@@ -1,8 +1,8 @@
 """
 02a_get_fundamentals.py
 
-Pulls raw fundamental facts from SEC EDGAR's free company-facts API
-for the water-sector universe.
+Pulls raw fundamental facts from SEC EDGAR's free company-facts API for
+the 222-ticker S&P 500 universe (TICKERS below).
 
 This script ONLY downloads. All cleaning happens in 02b_clean_fundamentals.py,
 so you can re-clean without re-hitting the SEC API.
@@ -11,39 +11,39 @@ Key design point: every fact is stored with its `filed` date -- the day
 the number actually became public. That is what makes point-in-time
 correctness possible downstream and prevents look-ahead bias.
 
-AssetsCurrent / LiabilitiesCurrent are INSTANT balance-sheet facts (they
-support current_ratio downstream) and need no duration filtering or
-cumulative differencing in 02b_clean_fundamentals.py.
-EarningsPerShareDiluted is pulled but not currently used as a model
-input -- kept as a raw diagnostic column.
+The universe has grown from an initial 8-ticker water-utility set through
+a 28-ticker water/infrastructure-adjacent expansion to the current
+222-ticker S&P 500 universe spanning all 11 GICS sectors below. Every
+addition was verified via verify_candidate_tickers.py
+(scripts/verifications.py) before being added -- see that script and
+EXCLUDED_TICKERS in 02_clean_fundamentals.py (defense-in-depth reject
+list) for the full per-ticker screening rationale, including the
+recurring structural gaps found along the way: Financials/REITs
+structurally not tagging a PP&E-style capex figure, filers whose current
+CIK is too recent (a 2023 spinoff, for example) to clear the trading-
+history screen, and a handful of tickers needing a MANUAL_CIK_OVERRIDES
+entry because SEC's bulk company_tickers.json doesn't list them despite
+having active filings under that CIK.
 
-StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest is
-pulled alongside plain StockholdersEquity because at least one filer
-(CWT) stops tagging the plain version once it begins carrying a
-noncontrolling interest in equity (e.g. from a JV/subsidiary) and
-switches to this NCI-inclusive tag instead -- without it, roe/
-debt_to_equity would forward-fill a stale value for many consecutive
-quarters. 02b resolves between the two by priority (the same pattern
-used for CapEx below), never a blind alias/rename, since the
-NCI-inclusive figure can genuinely differ from the parent-only figure.
+TAGS accumulated a few additions along the way as individual filers'
+tagging quirks surfaced: AssetsCurrent/LiabilitiesCurrent for
+current_ratio (instant balance-sheet facts, no duration filtering
+needed); StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest
+as a fallback for filers (e.g. CWT) that stop tagging plain
+StockholdersEquity once they carry a noncontrolling interest; ProfitLoss
+as a fallback for filers (e.g. ECL) that tag NetIncomeLoss only
+sporadically but ProfitLoss (the NCI-inclusive variant) consistently; and
+PaymentsToAcquireOtherProductiveAssets for filers (e.g. ROP) that split
+capex reporting across two component tags with little overlap. All of
+these are resolved by priority downstream in 02b, never blindly aliased
+or summed, since the NCI-inclusive and parent-only variants of a figure
+can genuinely differ once a filer actually carries a noncontrolling
+interest.
 
-ProfitLoss is pulled alongside NetIncomeLoss for the same reason: some
-filers (e.g. Ecolab) tag NetIncomeLoss only intermittently but ProfitLoss
-(consolidated, including NCI) every quarter. 02b resolves these by
-priority (NetIncomeLoss preferred, ProfitLoss as fallback) rather than
-aliasing them, since the two figures can genuinely differ once a filer
-carries a noncontrolling interest.
-
-PaymentsToAcquireOtherProductiveAssets is pulled alongside
-PaymentsToAcquirePropertyPlantAndEquipment because some filers (e.g.
-Roper Technologies) split CapEx reporting across both tags with only
-partial overlap in coverage -- resolved by priority in CAPEX_PRIORITY,
-same as every other capex tag, never summed.
-
-The universe here is 28 tickers: the original 8 regulated water
-utilities plus 20 water-adjacent equipment/infrastructure/industrial
-names, each verified via verify_candidate_tickers.py
-(scripts/verifications.py) before being added.
+Requires the SEC_USER_AGENT environment variable to be set (see
+get_sec_headers() below) -- SEC EDGAR requires a real contact string in
+the User-Agent header on every request and will reject unidentified
+traffic.
 
 Output: data/raw/fundamentals_raw.csv
 """
@@ -58,13 +58,7 @@ import requests
 
 
 def get_sec_headers():
-    """Build the User-Agent header SEC EDGAR requires on every request.
-
-    SEC EDGAR's fair-access policy requires a real name/contact string in
-    the User-Agent, not a generic client string, and will reject
-    unidentified traffic -- so this fails loudly instead of silently
-    sending a placeholder.
-    """
+    """Build the User-Agent header SEC EDGAR requires on every request."""
     user_agent = os.environ.get("SEC_USER_AGENT")
     if not user_agent:
         sys.exit(
@@ -80,10 +74,13 @@ def get_sec_headers():
 HEADERS = get_sec_headers()
 
 TICKERS = [
+    # =====================================================================
+    # Original 28-ticker water-sector universe (unchanged by the pivot).
+    # =====================================================================
     # Original 8-ticker universe (regulated water utilities + water tech/infra)
     "AWK", "WTRG", "CWT", "AWR", "XYL", "VRT", "JCI", "BMI",
     # Added in the 8 -> 28 expansion, all verified via
-    # verify_candidate_tickers.py (output/tables/candidate_verification_20260808.csv).
+    # verify_candidate_tickers.py (output/tables/candidate_verification_20260808_8to28expansion.csv).
     # Water/fluid equipment manufacturers:
     "PNR", "MWA", "AOS", "ITT", "IEX", "FELE", "FLS", "DOV", "ECL", "GRC",
     # Water metering / plumbing:
@@ -92,6 +89,51 @@ TICKERS = [
     "ROP", "EMR", "PH", "HON",
     # Infrastructure construction incl. water/wastewater/drainage:
     "WMS", "GVA", "PWR", "MTZ",
+    # =====================================================================
+    # 194 tickers added in the 28 -> 222 S&P-500-universe pivot, all
+    # verified via verify_candidate_tickers.py (see that script's CHANGE
+    # LOG and output/tables/candidate_verification_20260808_sp500pivot.csv
+    # for full per-ticker screening results and rationale). Grouped by
+    # GICS sector for readability; sector totals include the original 28
+    # above (e.g. Industrials = 22 original + 14 new = 36).
+    # =====================================================================
+    # --- Information Technology (32 total: 1 original + 31 new) ---
+    "MSFT", "AAPL", "NVDA", "ORCL", "CRM", "ADBE", "CSCO", "AMD", "QCOM",
+    "TXN", "IBM", "INTU", "AMAT", "ADI", "LRCX", "KLAC", "MU", "SNPS",
+    "CDNS", "ADSK", "MCHP", "ON", "TER", "WDC", "STX", "NTAP", "TYL",
+    "PTC", "SWKS", "GRMN", "ZBRA",
+    # --- Health Care (26 total, all new) ---
+    "JNJ", "UNH", "LLY", "MRK", "PFE", "TMO", "ABT", "DHR", "BMY", "AMGN",
+    "GILD", "CVS", "ELV", "HUM", "SYK", "BSX", "ISRG", "ZBH", "BDX", "BAX",
+    "VRTX", "BIIB", "MCK", "COR", "HCA", "DVA",
+    # --- Financials (24 total, all new) ---
+    "C", "GS", "MS", "BNY", "SCHW", "SPGI", "MCO", "ICE", "AON", "MRSH",
+    "AJG", "ALL", "PGR", "HIG", "STT", "FITB", "AXP", "COF", "NDAQ",
+    "MSCI", "FDS", "CBOE", "NTRS", "WTW",
+    # --- Consumer Discretionary (24 total, all new) ---
+    "AMZN", "TSLA", "HD", "MCD", "LOW", "SBUX", "TJX", "ORLY", "AZO",
+    "ROST", "YUM", "MAR", "HLT", "GM", "APTV", "BBY", "DHI", "PHM", "NVR",
+    "WHR", "TSCO", "ULTA", "GPC", "CMG",
+    # --- Communication Services (10 total, all new) ---
+    "NFLX", "T", "VZ", "TMUS", "EA", "TTWO", "OMC", "LYV", "MTCH", "SIRI",
+    # --- Industrials (36 total: 22 original + 14 new) ---
+    "CAT", "DE", "UNP", "FDX", "BA", "LMT", "RTX", "GD", "NOC", "CSX",
+    "NSC", "WM", "RSG", "GE",
+    # --- Consumer Staples (15 total, all new) ---
+    "PG", "KO", "PEP", "COST", "WMT", "PM", "MO", "MDLZ", "CL", "KMB",
+    "GIS", "ADM", "CAG", "CLX", "CHD",
+    # --- Energy (12 total, all new) ---
+    "CVX", "EOG", "SLB", "MPC", "VLO", "OXY", "WMB", "KMI", "OKE", "DVN",
+    "HAL", "TRGP",
+    # --- Utilities (17 total: 4 original water utilities + 13 new) ---
+    "AEP", "DUK", "SO", "D", "EXC", "XEL", "ED", "PEG", "ES", "FE", "ETR",
+    "EIX", "PPL",
+    # --- Real Estate (13 total, all new) ---
+    "AMT", "EQIX", "CCI", "PSA", "O", "WELL", "AVB", "EQR", "VTR", "IRM",
+    "UDR", "HST", "BXP",
+    # --- Materials (13 total: 1 original + 12 new) ---
+    "APD", "SHW", "FCX", "NEM", "PPG", "NUE", "ALB", "CE", "IFF", "MLM",
+    "VMC", "IP",
 ]
 # MSEX excluded: >50% of its ROE history had to be forward-filled from
 # stale quarters (a 25-consecutive-quarter flat run at worst) because
@@ -118,12 +160,23 @@ TICKERS = [
 # spinoff, giving it ~19-27 quarters of history depending on tag --
 # well under both MIN_QUARTERS=30 and the project's >=10-year trading
 # history screen. Not a data-quality gap, just too new under this CIK.
+# The remaining NOT USABLE candidates from the S&P-500-pivot screen are
+# not individually re-explained here -- see EXCLUDED_TICKERS in
+# 02_clean_fundamentals.py (defense-in-depth reject list) and
+# verifications.py for the full per-ticker screening detail.
 
 # SEC's ticker->CIK file keys on current registered name, so a recent
 # rename can break the automatic lookup (this is what happened with
 # SJW, which now files as "H2O America"). Add any ticker the scraper
 # warns about here, verified at sec.gov.
-MANUAL_CIK_OVERRIDES = {}
+MANUAL_CIK_OVERRIDES = {
+    # American Electric Power: active CIK with current SEC filings
+    # (confirmed via data.sec.gov/submissions/CIK0000004904.json), but
+    # absent from SEC's bulk company_tickers.json -- a bulk-file gap,
+    # not a rename/restructuring. See verifications.py for how this
+    # was diagnosed.
+    "AEP": "0000004904",
+}
 
 # XBRL tags to pull. SEC's taxonomy is NOT standardized across
 # companies or across time, so several concepts need multiple tags.
@@ -214,7 +267,14 @@ TAG_TAXONOMY = {
 }
 
 OUT_PATH = Path("data/raw/fundamentals_raw.csv")
-SEC_REQUEST_DELAY = 0.15  # SEC asks for <=10 req/sec; stay well under
+# SEC asks for <=10 req/sec; stay well under. At 28 tickers this delay
+# alone adds ~4s total (dwarfed by per-request network latency). At the
+# ~230-ticker S&P 500 target, expect the enforced delay to add ~35s
+# total, with actual wall-clock time for this whole script dominated by
+# per-company-facts-request network latency instead -- realistically on
+# the order of 10-15 minutes end to end, not something this constant
+# controls.
+SEC_REQUEST_DELAY = 0.15
 
 
 def get_cik_map(tickers):
