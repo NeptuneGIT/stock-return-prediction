@@ -3,10 +3,10 @@
 # long an equal-weighted basket of the top N, hold for that quarter.
 # Compares against SPY over the full pooled walk-forward window.
 #
-# GBRT is used here as the primary model (see 03_models.R for the full
-# comparison against PLS and Random Forest) -- its walk-forward R^2
-# doesn't always beat PLS's, all three are small and arguably within
-# noise at this sample size.
+# GBRT is this project's primary model (see 03_models.R and
+# docs/METHODOLOGY.md for the full comparison against PLS and Random
+# Forest) -- its walk-forward R^2 doesn't always beat PLS's, all three
+# are small and arguably within noise at this sample size.
 #
 # N is a sensitivity grid (10/20/30/50), not one hardcoded number -- the
 # course spec doesn't hand down a single "correct" N. N=20 is the
@@ -37,13 +37,11 @@ N_PRIMARY <- 20
 
 gbm_pred <- read_csv(file.path(PROC_DIR, "gbrt_walkforward_predictions.csv"), show_col_types = FALSE)
 
-# panel.csv carries a handful of duplicate (ticker, quarter_end) rows --
-# the point-in-time fundamentals join occasionally matches more than one
-# qualifying filing instead of collapsing to exactly one; root cause not
-# fixed at the source. Deduplicated here the same deterministic way
-# (first occurrence in CSV row order) as in 03_models.R, since this
-# script reads panel.csv directly. Skip this and the join below turns
-# many-to-many, failing the sanity check below.
+# panel.csv carries a handful of duplicate (ticker, quarter_end) rows (see
+# 03_models.R's matching comment and docs/METHODOLOGY.md for why).
+# Deduplicated here the same deterministic way (first occurrence in CSV
+# row order), since this script reads panel.csv directly. Skip this and
+# the join below turns many-to-many, failing the sanity check below.
 panel <- read_csv(file.path(PROC_DIR, "panel.csv"), show_col_types = FALSE) %>%
   select(ticker, quarter_end, sector, qtr_ret_next, bench_ret_next) %>%
   distinct(ticker, quarter_end, .keep_all = TRUE)

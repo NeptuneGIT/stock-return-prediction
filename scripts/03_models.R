@@ -1,3 +1,40 @@
+# 03_models.R -- fits and compares the three models required by the course spec
+# (PLS, Random Forest, GBRT) against the quarterly modelling panel, and produces
+# the forward-looking scores that scripts/05_top30_forecast.R consumes.
+#
+# Target: exret_next, a ticker's next-quarter return minus SPY's next-quarter
+# return over the same period (built in scripts/01a_ratios.R). GBRT is this
+# project's headline model; PLS and Random Forest are fit identically and
+# reported alongside it as the comparison baseline -- see docs/METHODOLOGY.md
+# for the full model-selection narrative and why GBRT is reported as the
+# primary result despite PLS's walk-forward R^2 numerically edging it out on
+# some runs.
+#
+# Validation: walk-forward only, no fixed calendar train/test split. Folds are
+# expanding-window and time-respecting -- every fold trains only on quarters
+# strictly before its own validation block -- which is what actually prevents
+# look-ahead bias here, not any particular calendar cutoff. GBRT's n.trees and
+# PLS's ncomp are chosen this way; Random Forest's mtry is fixed at the package
+# regression default (floor(p/3)) rather than grid-searched (see
+# fit_rf_walkforward()'s comment below for why). The pooled out-of-fold
+# predictions this produces are the ONLY historical-quarter out-of-sample
+# numbers this script or any downstream script may report.
+#
+# Each model is also refit once on the ENTIRE panel at its walk-forward-selected
+# hyperparameter. This entire-panel fit is used only for variable importance and
+# to forward-score the current not-yet-realized quarter (for
+# scripts/05_top30_forecast.R) -- it must NEVER be used to generate a
+# historical-quarter prediction, since it has seen every quarter and doing so
+# would leak future information into the past. See docs/METHODOLOGY.md for the
+# full reasoning; treat any change that blurs this separation as a
+# look-ahead-bias regression, not a refactor.
+#
+# A second, supplementary GBRT model is also fit here against a 4-quarter-ahead
+# target (exret_next4, built in 01a_ratios.R) purely to power
+# scripts/05_top30_forecast.R's "next year" forecast with a genuinely
+# re-estimated model instead of naively compounding the 1-quarter result. This
+# does not change which model is primary -- GBRT on the 1-quarter exret_next
+# target remains the result reported in the README and the project report.
 #
 # Input:  data/processed/panel.csv          (01a_ratios.R)
 # Output: data/processed/ols_diagnostics[_sector].csv
@@ -42,20 +79,25 @@ PREDICTORS <- c(
 )
 
 
+# 1. Load the panel, deduplicate, and drop rows with no realized target yet
+
 panel <- read_csv(file.path(PROC_DIR, "panel.csv"), show_col_types = FALSE)
 
-# panel.csv carries a handful of duplicate (ticker, quarter_end) rows --
-# the point-in-time fundamentals join occasionally matches more than one
-# qualifying filing instead of collapsing to exactly one. Deduplicated
-# here deterministically (first occurrence wins); root cause not fixed
-# at the source.
+# panel.csv can contain a handful of duplicate (ticker, quarter_end) rows --
+# identical price/return/technical columns but differing fundamentals-derived
+# columns, consistent with the point-in-time fundamentals join in 01a_ratios.R
+# occasionally fanning out to more than one qualifying filing instead of
+# collapsing to exactly one. This dedup is a deterministic downstream
+# workaround (first occurrence wins), not a fix at the source -- see
+# docs/METHODOLOGY.md for the known-issue writeup.
 n_before_dedup <- nrow(panel)
 panel <- panel %>% distinct(ticker, quarter_end, .keep_all = TRUE)
 n_dup_dropped <- n_before_dedup - nrow(panel)
 if (n_dup_dropped > 0) {
   warning(n_dup_dropped, " duplicate (ticker, quarter_end) row(s) dropped ",
           "from panel.csv. This is a pre-existing panel.csv data-integrity ",
-          "issue, not something introduced by this script.")
+          "issue (see docs/METHODOLOGY.md), not something introduced by ",
+          "this script.")
 }
 
 
@@ -113,6 +155,9 @@ y_full <- full_df[[TARGET_VAR]]
 
 
 
+# 3. Diagnostic: correlations + unpenalized OLS over the entire panel
+#    (a descriptive baseline only, not used to select or tune any model below)
+
 message("\n--- Diagnostic: correlations with ", TARGET_VAR, " (entire panel) ---")
 full_cor <- sapply(PREDICTORS, function(p) cor(x_full[, p], y_full))
 print(sort(full_cor, decreasing = TRUE))
@@ -144,6 +189,8 @@ message("\nSaved diagnostics (correlation + OLS coefficients/p-values) -> ",
         ols_diagnostics_path)
 
 
+
+# 4. Shared metric helpers and walk-forward fold construction
 
 rmse <- function(actual, pred) sqrt(mean((actual - pred)^2))
 r_squared <- function(actual, pred) {
@@ -305,7 +352,15 @@ fit_pls_walkforward <- function(df, target_col, predictors, folds,
        fold_summary = fold_summary, n_folds = length(folds))
 }
 
-#  Random Forest walk-forward:
+# Random Forest walk-forward validation. Unlike GBRT's n.trees and PLS's
+# ncomp, mtry is passed in fixed rather than grid-searched over candidate
+# values within this function: once the fold set spans the entire panel
+# (rather than a small pre-2023 subset), a multi-value mtry grid -- each
+# candidate a full untuned randomForest() fit, repeated across every fold --
+# became too slow to run in practice. mtry is fixed at the package
+# regression default (floor(p/3)) instead; Random Forest is still evaluated
+# by the same pooled out-of-fold walk-forward metric as the other two
+# models at that fixed value.
 fit_rf_walkforward <- function(df, target_col, predictors, folds, mtry,
                                 ntree, seed, p_adj) {
   fold_fits <- lapply(seq_along(folds), function(i) {
@@ -373,6 +428,10 @@ message("\nWalk-forward validation: ", length(wf_folds), " expanding-window fold
         "before its own validation block.")
 
 
+# 5. Random Forest: walk-forward validation, then a single entire-panel fit
+#    (the entire-panel fit is used for variable importance only -- see the
+#    top-of-file note on why it must never score a historical quarter)
+
 RF_MTRY <- max(floor(length(PREDICTORS) / 3), 1)
 RF_NTREE <- 500
 
@@ -403,8 +462,7 @@ message("  OOB MSE = ", signif(rf_fit$mse[rf_fit$ntree], 4),
 message("\nVariable importance (%IncMSE / IncNodePurity):")
 print(importance(rf_fit))
 
-# 5. Predict + evaluate: in-sample (entire panel) vs. walk-forward
-
+# Predict + evaluate: in-sample (entire panel) vs. walk-forward
 
 rf_pred_full <- as.numeric(predict(rf_fit, newdata = x_full))
 
@@ -418,8 +476,7 @@ rf_metrics <- data.frame(
 rf_metrics$adjusted_r_squared <- adj_r_squared(rf_metrics$r_squared, rf_metrics$n, length(PREDICTORS))
 print(rf_metrics)
 
-# 6. Write outputs
-
+# Write Random Forest outputs
 
 rf_predictions <- full_df %>%
   transmute(ticker, quarter_end, actual = .data[[TARGET_VAR]], pred = rf_pred_full)
@@ -439,7 +496,10 @@ message("\nSaved ", nrow(rf_predictions), " in-sample predictions -> ", rf_predi
 message("Saved ", nrow(rf_importance), " importance rows -> ", rf_importance_path)
 
 
-# 7. Fit: PLS (Partial Least Squares), ncomp via walk-forward validation
+# 6. PLS (Partial Least Squares): walk-forward validation, then a single
+#    entire-panel fit. ncomp is chosen two ways -- the minimum-average-RMSE
+#    value (ncomp_min) and a more conservative one-standard-error rule
+#    (ncomp_1se) -- and both are reported throughout.
 
 
 MAX_NCOMP <- length(PREDICTORS)
@@ -519,7 +579,10 @@ message("\nSaved ", nrow(pls_predictions), " PLS in-sample predictions -> ", pls
 message("Saved ", nrow(pls_coefficients), " PLS coefficients -> ", pls_coefficients_path)
 
 
-# 8. Fit: Gradient Boosted Regression Trees (GBRT, gbm package)
+# 7. GBRT (Gradient Boosted Regression Trees, gbm package), 1-quarter-ahead
+#    target -- this project's primary model. Walk-forward validation, then a
+#    single entire-panel fit used for variable importance and forward
+#    scoring only (see the top-of-file note).
 
 GBM_N_TREES <- 2000
 GBM_SHRINKAGE <- 0.01
@@ -625,6 +688,11 @@ write_csv(gbrt_ticker_r2, gbrt_ticker_r2_path)
 message("Saved ", nrow(gbrt_ticker_r2), " per-ticker walk-forward R^2 rows -> ", gbrt_ticker_r2_path)
 
 
+# 8. Supplementary 4-quarter-ahead GBRT model (exret_next4). Fit purely to
+#    power scripts/05_top30_forecast.R's "next year" forecast with a
+#    genuinely re-estimated model rather than compounding the 1Q result;
+#    does not change GBRT-on-exret_next's status as the primary model.
+
 TARGET_VAR_4Q <- "exret_next4"
 
 message("\n--- Supplementary 4Q GBRT model (", TARGET_VAR_4Q, ") ---")
@@ -711,6 +779,9 @@ message("Saved ", nrow(gbrt_walkforward_predictions_4q), " 4Q pooled out-of-fold
         gbrt_wf_predictions_4q_path)
 
 
+# 9. Combined model-metrics summary -- every in-sample/walk-forward metric
+#    table above, in one file, for the README/report to cite directly
+
 model_metrics_summary <- bind_rows(
   rf_metrics %>% mutate(model = "random_forest", target = "exret_next (1Q)",
                          variant = NA_character_, hyperparam = paste0("mtry=", RF_MTRY)),
@@ -729,6 +800,12 @@ write_csv(model_metrics_summary, model_metrics_summary_path)
 message("\nSaved combined model-comparison summary (RF/PLS/GBRT, in-sample + walk-forward) -> ",
         model_metrics_summary_path)
 
+
+# 10. Forward-score the current not-yet-realized quarter (both horizons) using
+#     the entire-panel-trained GBRT fits, and record the SPY forward-return
+#     assumption used to turn those excess-return predictions into absolute
+#     price/dollar projections. Powers scripts/05_top30_forecast.R only --
+#     this is never a historical-quarter prediction.
 
 is_complete_forward <- forward_raw %>% select(all_of(PREDICTORS)) %>% complete.cases()
 excluded_forward <- forward_raw$ticker[!is_complete_forward]

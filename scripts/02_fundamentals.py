@@ -31,8 +31,9 @@ def get_sec_headers():
     """Build the User-Agent header SEC EDGAR requires on every request.
 
     SEC EDGAR's fair-access policy requires a real name/contact string, not a
-    generic client string. Failing loudly here beats silently sending a
-    placeholder that SEC could start blocking without warning.
+    generic client string -- see https://www.sec.gov/os/webmaster-faq#developers.
+    Failing loudly here beats silently sending a placeholder that SEC could
+    start blocking without warning.
     """
     user_agent = os.environ.get("SEC_USER_AGENT")
     if not user_agent:

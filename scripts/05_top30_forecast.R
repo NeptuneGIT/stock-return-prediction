@@ -1,6 +1,6 @@
-# 05_top30_forecast.R -- standalone report, not part of the main pipeline:
-# ranks tickers by GBRT per-ticker pooled walk-forward R^2, takes the top
-# 30, projects a $10 investment's value at Q3 2026 and Q2 2027.
+# 05_top30_forecast.R -- standalone report, not a pipeline result: ranks
+# tickers by GBRT per-ticker pooled walk-forward R^2, takes the top 30,
+# projects a $10 investment's value at Q3 2026 and Q2 2027.
 #
 # Output: output/tables/top30_forecast_<date>.csv
 
@@ -124,9 +124,9 @@ message("- Ticker selection ranks by 1Q GBRT per-ticker POOLED WALK-FORWARD ",
         "(PLS has numerically edged it out on some runs) -- so even the ",
         "BEST individually-ranked tickers here are selected from a model ",
         "with weak aggregate out-of-sample skill. GBRT is used throughout ",
-        "this project as the primary model; read every ranking and figure ",
-        "below with that weak aggregate skill in mind, not as evidence GBRT ",
-        "is the strongest model on every run.")
+        "this project as the model of record (see docs/METHODOLOGY.md); ",
+        "read every ranking and figure below with that weak aggregate skill ",
+        "in mind, not as evidence GBRT is the strongest model on every run.")
 message("- Q2 2027 uses a genuinely separate 4-quarter-ahead GBRT model with a ",
         "SHORTER, noisier usable quarter range than the 1Q model -- its ",
         "walk-forward R^2 should be read with even more caution.")
@@ -136,9 +136,9 @@ message("- Both GBRT models used for the forward predictions below (1Q and ",
         "quarter -- this is deliberate (a forward forecast should use all ",
         "available history, not blind itself to 2023-2026 data) and is ",
         "look-ahead-safe because it only ever scores a quarter that comes ",
-        "AFTER every training quarter; see 03_models.R's top-of-file note ",
-        "for the full reasoning and the hard rule that this same fit must ",
-        "NEVER be used to score a historical quarter.")
+        "AFTER every training quarter; see docs/METHODOLOGY.md for the full ",
+        "reasoning and the hard rule that this same fit must NEVER be used ",
+        "to score a historical quarter.")
 message("- SPY's own future return is NOT modelled -- it is assumed to equal ",
         "the mean of SPY's REALIZED return over the pooled walk-forward ",
         "validation window at the matching horizon (1Q assumption = ",

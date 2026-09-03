@@ -14,6 +14,7 @@ coverage over the study window (>= MIN_QUARTERS from STUDY_START_YEAR).
 Output: PASS/FAIL table to console, plus a persisted CSV at
 output/tables/candidate_verification_<YYYYMMDD>.csv. USABLE candidates go
 into TICKERS/STOCKS; NOT USABLE ones get appended to EXCLUDED_TICKERS.
+See docs/METHODOLOGY.md for the full ticker-screening workflow.
 
 Requires the SEC_USER_AGENT environment variable (see get_sec_headers()
 below) -- SEC EDGAR requires a real contact string in the User-Agent header
@@ -34,8 +35,9 @@ def get_sec_headers():
     """Build the User-Agent header SEC EDGAR requires on every request.
 
     SEC EDGAR's fair-access policy requires a real name/contact string, not a
-    generic client string. Failing loudly here beats silently sending a
-    placeholder that SEC could start blocking without warning.
+    generic client string -- see https://www.sec.gov/os/webmaster-faq#developers.
+    Failing loudly here beats silently sending a placeholder that SEC could
+    start blocking without warning.
     """
     user_agent = os.environ.get("SEC_USER_AGENT")
     if not user_agent:

@@ -1,10 +1,17 @@
 # main.R -- runs the full pipeline: scrape, clean, merge, train, backtest, forecast.
-# Each stage is its own subprocess, not source()/import -- the dividends step
-# (scripts/01_get_data.R's quantmod::getDividends call) can segfault the R
-# process outright in some environments, and running it in-process could take
-# the whole pipeline down with it.
-
-SKIP_SCRAPE <- TRUE
+#
+# Each stage is its own subprocess rather than source()/import. This matters because
+# the dividends step (scripts/01_get_data.R's quantmod::getDividends call) has been
+# observed to segfault the R process outright in some environments -- not a catchable
+# R-level error, so running it in-process could take the whole pipeline down with it.
+# Running each stage as a subprocess means a segfault there is just a nonzero exit
+# status this script can react to (see the fallback logic below), not a crash here.
+#
+# SKIP_SCRAPE defaults to TRUE so a run reuses the data already on disk (data/raw/,
+# data/processed/fundamentals_clean.csv) instead of re-hitting SEC EDGAR / Yahoo
+# Finance / FRED, which are slow and rate-limited. Override with an environment
+# variable, e.g. `SKIP_SCRAPE=false Rscript main.R`, to re-scrape from scratch.
+SKIP_SCRAPE <- as.logical(Sys.getenv("SKIP_SCRAPE", "TRUE"))
 
 run_rscript <- function(path) {
   message("\n=== Running ", path, " ===")
